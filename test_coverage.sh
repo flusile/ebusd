@@ -50,9 +50,9 @@
 ./src/ebusd/ebusd -f --mqttport=9999999 >/dev/null 2>/dev/null
 ./src/ebusd/ebusd -f --mqttuser=username --mqttpass=password --mqttclientid=1234 --mqttport=1883 --mqtttopic=ebusd/%circuit/%name/%field --mqttretain --mqttjson --mqttverbose --mqttlog --mqttignoreinvalid --mqttchanges --mqtthost "" >/dev/null 2>/dev/null
 ./src/ebusd/ebusd -f --mqttca=/cafile/ --mqttcert=/cert --mqttkey=12345678 --mqttkeypass=secret --mqttinsecure >/dev/null 2>/dev/null
-./src/ebusd/ebusd -c contrib/etc/ebusd --checkconfig --dumpconfig -s -f -i "ff08070400/0ab5303132333431313131" >/dev/null
-./src/ebusd/ebusd -c contrib/etc/ebusd --checkconfig --dumpconfig -s -f -i "ff08070400" >/dev/null 2>/dev/null
-./src/ebusd/ebusd -c contrib/etc/ebusd --checkconfig --dumpconfig -s -f -i "ff080704/" >/dev/null 2>/dev/null
+./src/ebusd/ebusd -c contrib/etc/ebusd -s -f --inject=stop "ff08070400/0ab5303132333431313131" >/dev/null 2>/dev/null
+./src/ebusd/ebusd -c contrib/etc/ebusd -s -f --inject=stop "ff08070400" >/dev/null 2>/dev/null
+./src/ebusd/ebusd -c contrib/etc/ebusd -s -f --inject=stop "ff080704/" >/dev/null 2>/dev/null
 cat >contrib/etc/ebusd/bad.csv <<EOF
 u,broadcast,outsidetemp,,,fe,b516,01,temp2,m,UCH,2000000000
 u,broadcast,outsidetemp,,,fe,b516,01,temp2,m,D2B,2000000000=
@@ -88,7 +88,18 @@ echo > dump
 ./src/tools/ebusctl --help >/dev/null
 ./src/tools/ebusctl 'help x' >/dev/null 2>/dev/null
 ./src/tools/ebuspicloader --help >/dev/null
+./src/tools/ebuspicloader -i "" >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -i x >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -i 192.168.0.10.1 >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -i 192.168.0.10 -d >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -m "" >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -m 65 >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -d -i 192.168.0.10 >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -d -m "" >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -d >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -a 9000 >/dev/null 2>/dev/null
 ./src/tools/ebuspicloader -a 150 -f ./src/tools/ebuspicloader -i 192.168.0.10 -m 24 -M -r -s -v /dev/zero >/dev/null 2>/dev/null
+./src/tools/ebuspicloader -f x >/dev/null 2>/dev/null
 echo -e ':100800008431542CAE3401347E1484314E01961E52\n:00000001FF' > firmware.hex
 ./src/tools/ebuspicloader -f firmware.hex >/dev/null
 #server:

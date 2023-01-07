@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2015-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2015-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,16 +24,13 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #ifdef HAVE_LINUX_SERIAL
 #  include <linux/serial.h>
 #endif
 #ifdef HAVE_FREEBSD_UFTDI
 #  include <dev/usb/uftdiio.h>
 #endif
-#include <errno.h>
 #ifdef HAVE_PPOLL
 #  include <poll.h>
 #endif
@@ -44,6 +41,8 @@
 #include <ios>
 #include <iomanip>
 #include "lib/ebus/data.h"
+#include "lib/utils/clock.h"
+#include "lib/utils/tcpsocket.h"
 
 namespace ebusd {
 
@@ -79,9 +78,10 @@ namespace ebusd {
 Device::Device(const char* name, bool checkDevice, unsigned int latency, bool readOnly, bool initialSend,
     bool enhancedProto)
   : m_name(name), m_checkDevice(checkDevice),
-    m_latency(HOST_LATENCY_MS+(enhancedProto?ENHANCED_LATENCY_MS:0)+latency), m_readOnly(readOnly), m_initialSend(initialSend),
-    m_enhancedProto(enhancedProto), m_fd(-1), m_listener(nullptr), m_arbitrationMaster(SYN),
-    m_arbitrationCheck(false), m_bufSize(((MAX_LEN+1+3)/4)*4), m_bufLen(0), m_bufPos(0),
+    m_latency(HOST_LATENCY_MS+(enhancedProto?ENHANCED_LATENCY_MS:0)+latency), m_readOnly(readOnly),
+    m_initialSend(initialSend), m_enhancedProto(enhancedProto), m_fd(-1), m_resetRequested(false),
+    m_listener(nullptr), m_arbitrationMaster(SYN),
+    m_arbitrationCheck(0), m_bufSize(((MAX_LEN+1+3)/4)*4), m_bufLen(0), m_bufPos(0),
     m_extraFatures(0), m_infoId(0xff), m_infoLen(0), m_infoPos(0) {
   m_buffer = reinterpret_cast<symbol_t*>(malloc(m_bufSize));
   if (!m_buffer) {
@@ -97,7 +97,8 @@ Device::~Device() {
 }
 
 Device* Device::create(const char* name, unsigned int extraLatency, bool checkDevice, bool readOnly, bool initialSend) {
-  bool enhanced = strncmp(name, "enh:", 4) == 0;
+  bool highSpeed = strncmp(name, "ens:", 4) == 0;
+  bool enhanced = highSpeed || strncmp(name, "enh:", 4) == 0;
   if (enhanced) {
     name += 4;
   }
@@ -133,8 +134,8 @@ Device* Device::create(const char* name, unsigned int extraLatency, bool checkDe
     free(in);
     return new NetworkDevice(name, hostOrIp, port, extraLatency, readOnly, initialSend, udp, enhanced);
   }
-  // support enh:/dev/<device>
-  return new SerialDevice(name, checkDevice, extraLatency, readOnly, initialSend, enhanced);
+  // support enh:/dev/<device>, ens:/dev/<device>, and /dev/<device>
+  return new SerialDevice(name, checkDevice, extraLatency, readOnly, initialSend, enhanced, highSpeed);
 }
 
 result_t Device::open() {
@@ -149,6 +150,7 @@ result_t Device::afterOpen() {
     symbol_t buf[2] = makeEnhancedSequence(ENH_REQ_INIT, 0x01);  // extra feature: info
 #ifdef DEBUG_RAW_TRAFFIC
     fprintf(stdout, "raw enhanced > %2.2x %2.2x\n", buf[0], buf[1]);
+    fflush(stdout);
 #endif
     if (::write(m_fd, buf, 2) != 2) {
       return RESULT_ERR_SEND;
@@ -156,6 +158,7 @@ result_t Device::afterOpen() {
     if (m_listener != nullptr) {
       m_listener->notifyStatus(false, "resetting");
     }
+    m_resetRequested = true;
   } else if (m_initialSend && !write(ESC)) {
     return RESULT_ERR_SEND;
   }
@@ -181,10 +184,10 @@ bool Device::isValid() {
 }
 
 result_t Device::requestEnhancedInfo(symbol_t infoId) {
-  if (!m_enhancedProto || m_extraFatures == 0 || infoId == 0xff) {
+  if (!m_enhancedProto || m_extraFatures == 0) {
     return RESULT_ERR_INVALID_ARG;
   }
-  for (unsigned int i=0; i<4; i++) {
+  for (unsigned int i = 0; i < 4; i++) {
     if (m_infoId == 0xff) {
       break;
     }
@@ -193,15 +196,24 @@ result_t Device::requestEnhancedInfo(symbol_t infoId) {
   if (m_infoId != 0xff) {
     return RESULT_ERR_DUPLICATE;
   }
+  if (infoId == 0xff) {
+    // just waited for completion
+    return RESULT_OK;
+  }
+  return sendEnhancedInfoRequest(infoId);
+}
+
+result_t Device::sendEnhancedInfoRequest(symbol_t infoId) {
   symbol_t buf[2] = makeEnhancedSequence(ENH_REQ_INFO, infoId);
 #ifdef DEBUG_RAW_TRAFFIC
   fprintf(stdout, "raw enhanced > %2.2x %2.2x\n", buf[0], buf[1]);
+  fflush(stdout);
 #endif
-  m_infoPos = 0;
-  m_infoId = infoId;
   if (::write(m_fd, buf, 2) != 2) {
     return RESULT_ERR_DEVICE;
   }
+  m_infoPos = 0;
+  m_infoId = infoId;
   return RESULT_OK;
 }
 
@@ -210,7 +222,7 @@ string Device::getEnhancedInfos() {
     return "";
   }
   result_t res;
-  if (m_enhInfoTemperature.empty()) {
+  if (m_enhInfoTemperature.empty()) {  // use empty temperature for potential refresh after reset
     res = requestEnhancedInfo(0);
     if (res != RESULT_OK) {
       return "cannot request version";
@@ -224,6 +236,10 @@ string Device::getEnhancedInfos() {
       return "cannot request config";
     }
   }
+  res = requestEnhancedInfo(6);
+  if (res != RESULT_OK) {
+    return "cannot request reset info";
+  }
   res = requestEnhancedInfo(3);
   if (res != RESULT_OK) {
     return "cannot request temperature";
@@ -236,11 +252,12 @@ string Device::getEnhancedInfos() {
   if (res != RESULT_OK) {
     return "cannot request bus voltage";
   }
-  usleep(8*40000);
-  if (m_infoPos == 0) {
-    return "did not get info";
+  res = requestEnhancedInfo(0xff);
+  if (res != RESULT_OK) {
+    m_enhInfoBusVoltage = "bus voltage unknown";
   }
-  return m_enhInfoTemperature + ", " + m_enhInfoSupplyVoltage + ", " + m_enhInfoBusVoltage;
+  return "firmware " + m_enhInfoVersion + ", " + m_enhInfoTemperature + ", " + m_enhInfoSupplyVoltage + ", "
+  + m_enhInfoBusVoltage;
 }
 
 result_t Device::send(symbol_t value) {
@@ -258,16 +275,16 @@ result_t Device::send(symbol_t value) {
 
 /**
  * the maximum duration in milliseconds to wait for an enhanced sequence to complete after the first part was already
- * retrieved: 2* (Start+8Bit+Stop+Extra @ 9600Bd)
+ * retrieved (3ms rounded up to the next 10ms): 2* (Start+8Bit+Stop+Extra @ 9600Bd)
  */
-#define ENHANCED_COMPLETE_WAIT_DURATION 3
+#define ENHANCED_COMPLETE_WAIT_DURATION 10
 
 
 bool Device::cancelRunningArbitration(ArbitrationState* arbitrationState) {
   if (m_enhancedProto && m_arbitrationMaster != SYN) {
     *arbitrationState = as_error;
     m_arbitrationMaster = SYN;
-    m_arbitrationCheck = false;
+    m_arbitrationCheck = 0;
     write(SYN, true);
     return true;
   }
@@ -276,7 +293,7 @@ bool Device::cancelRunningArbitration(ArbitrationState* arbitrationState) {
   }
   *arbitrationState = as_error;
   m_arbitrationMaster = SYN;
-  m_arbitrationCheck = false;
+  m_arbitrationCheck = 0;
   return true;
 }
 
@@ -288,11 +305,10 @@ result_t Device::recv(unsigned int timeout, symbol_t* value, ArbitrationState* a
     cancelRunningArbitration(arbitrationState);
     return RESULT_ERR_DEVICE;
   }
-  bool repeat = false;
   bool repeated = false;
   timeout += m_latency;
+  uint64_t until = clockGetMillis() + timeout;
   do {
-    repeat = false;
     bool isAvailable = available();
     if (!isAvailable && timeout > 0) {
       int ret;
@@ -345,18 +361,22 @@ result_t Device::recv(unsigned int timeout, symbol_t* value, ArbitrationState* a
 
     // directly read byte from device
     bool incomplete = false;
-    if (!read(value, isAvailable, arbitrationState, &incomplete)) {
-      if (!isAvailable && incomplete && !repeated) {
-        // for a two-byte transfer another poll is needed
-        repeat = true;
-        repeated = true;
-        timeout = m_latency+ENHANCED_COMPLETE_WAIT_DURATION;
-        continue;
-      }
+    if (read(value, isAvailable, arbitrationState, &incomplete)) {
+      break;  // don't repeat on successful read
+    }
+    if (!isAvailable && incomplete && !repeated) {
+      // for a two-byte transfer another poll is needed
+      repeated = true;
+      timeout = m_latency+ENHANCED_COMPLETE_WAIT_DURATION;
+      continue;
+    }
+    uint64_t now = clockGetMillis();
+    if (now >= until) {
       return RESULT_ERR_TIMEOUT;
     }
-  } while (repeat);
-  if (m_enhancedProto || *value != SYN || m_arbitrationMaster == SYN) {
+    timeout = static_cast<unsigned>(until - now);
+  } while (true);
+  if (m_enhancedProto || *value != SYN || m_arbitrationMaster == SYN || m_arbitrationCheck) {
     if (m_listener != nullptr) {
       m_listener->notifyDeviceData(*value, true);
     }
@@ -364,7 +384,7 @@ result_t Device::recv(unsigned int timeout, symbol_t* value, ArbitrationState* a
       if (m_arbitrationCheck) {
         *arbitrationState = *value == m_arbitrationMaster ? as_won : as_lost;
         m_arbitrationMaster = SYN;
-        m_arbitrationCheck = false;
+        m_arbitrationCheck = 0;
       } else {
         *arbitrationState = m_arbitrationMaster == SYN ? as_none : as_start;
       }
@@ -383,7 +403,7 @@ result_t Device::recv(unsigned int timeout, symbol_t* value, ArbitrationState* a
   if (m_listener != nullptr) {
     m_listener->notifyDeviceData(m_arbitrationMaster, false);
   }
-  m_arbitrationCheck = true;
+  m_arbitrationCheck = 1;
   *arbitrationState = as_running;
   return RESULT_OK;
 }
@@ -393,7 +413,7 @@ result_t Device::startArbitration(symbol_t masterAddress) {
     if (masterAddress != SYN) {
       return RESULT_ERR_ARB_RUNNING;  // should not occur
     }
-    m_arbitrationCheck = false;
+    m_arbitrationCheck = 0;
     m_arbitrationMaster = SYN;
     if (m_enhancedProto) {
       // cancel running arbitration
@@ -412,7 +432,7 @@ result_t Device::startArbitration(symbol_t masterAddress) {
       m_arbitrationMaster = SYN;
       return RESULT_ERR_SEND;
     }
-    m_arbitrationCheck = true;
+    m_arbitrationCheck = 1;
   }
   return RESULT_OK;
 }
@@ -422,13 +442,19 @@ bool Device::write(symbol_t value, bool startArbitration) {
     symbol_t buf[2] = makeEnhancedSequence(startArbitration ? ENH_REQ_START : ENH_REQ_SEND, value);
 #ifdef DEBUG_RAW_TRAFFIC
     fprintf(stdout, "raw enhanced > %2.2x %2.2x\n", buf[0], buf[1]);
+    fflush(stdout);
 #endif
     return ::write(m_fd, buf, 2) == 2;
   }
 #ifdef DEBUG_RAW_TRAFFIC
   fprintf(stdout, "raw > %2.2x\n", value);
+  fflush(stdout);
 #endif
+#ifdef SIMULATE_NON_WRITABILITY
+  return true;
+#else
   return ::write(m_fd, &value, 1) == 1;
+#endif
 }
 
 bool Device::available() {
@@ -438,12 +464,13 @@ bool Device::available() {
   if (!m_enhancedProto) {
     return true;
   }
-  // peek into the received enhanced proto bytes to determine symbol availability
+  // peek into the received enhanced proto bytes to determine received bus symbol availability
   for (size_t pos = 0; pos < m_bufLen; pos++) {
     symbol_t ch = m_buffer[(pos+m_bufPos)%m_bufSize];
     if (!(ch&ENH_BYTE_FLAG)) {
 #ifdef DEBUG_RAW_TRAFFIC
-      fprintf(stdout, "raw avail direct\n");
+      fprintf(stdout, "raw avail direct @%d+%d %2.2x\n", m_bufPos, pos, ch);
+      fflush(stdout);
 #endif
       return true;
     }
@@ -451,11 +478,14 @@ bool Device::available() {
       if (pos+1 >= m_bufLen) {
         return false;
       }
+      symbol_t cmd = (ch >> 2)&0xf;
       // peek into next byte to check if enhanced sequence is ok
       ch = m_buffer[(pos+m_bufPos+1)%m_bufSize];
       if (!(ch&ENH_BYTE_FLAG) || (ch&ENH_BYTE_MASK) != ENH_BYTE2) {
 #ifdef DEBUG_RAW_TRAFFIC
-        fprintf(stdout, "raw avail enhanced following bad\n");
+        fprintf(stdout, "raw avail enhanced following bad @%d+%d %2.2x %2.2x\n", m_bufPos, pos,
+          m_buffer[(pos+m_bufPos)%m_bufSize], ch);
+        fflush(stdout);
 #endif
         if (m_listener != nullptr) {
           m_listener->notifyStatus(true, "unexpected available enhanced following byte 1");
@@ -466,13 +496,19 @@ bool Device::available() {
         pos--;
         continue;
       }
+      if (cmd != ENH_RES_RECEIVED && cmd != ENH_RES_STARTED && cmd != ENH_RES_FAILED) {
+        pos++;
+        continue;
+      }
 #ifdef DEBUG_RAW_TRAFFIC
-      fprintf(stdout, "raw avail enhanced\n");
+      fprintf(stdout, "raw avail enhanced @%d+%d %2.2x %2.2x\n", m_bufPos, pos, m_buffer[(pos+m_bufPos)%m_bufSize], ch);
+      fflush(stdout);
 #endif
       return true;
     }
 #ifdef DEBUG_RAW_TRAFFIC
-    fprintf(stdout, "raw avail enhanced bad\n");
+    fprintf(stdout, "raw avail enhanced bad @%d+%d %2.2x\n", m_bufPos, pos, ch);
+    fflush(stdout);
 #endif
     if (m_listener != nullptr) {
       m_listener->notifyStatus(true, "unexpected available enhanced byte 2");
@@ -501,11 +537,19 @@ bool Device::read(symbol_t* value, bool isAvailable, ArbitrationState* arbitrati
           tail = (m_bufPos+m_bufLen) % m_bufSize;
           size_t head = m_bufLen-tail;
           memmove(m_buffer+head, m_buffer, tail);
+#ifdef DEBUG_RAW_TRAFFIC
+          fprintf(stdout, "raw move tail %d @0 to @%d\n", tail, head);
+          fflush(stdout);
+#endif
         } else {
           tail = 0;
         }
         // move head to first position
         memmove(m_buffer, m_buffer + m_bufPos, m_bufLen - tail);
+#ifdef DEBUG_RAW_TRAFFIC
+        fprintf(stdout, "raw move head %d @%d to 0\n", m_bufLen - tail, m_bufPos);
+        fflush(stdout);
+#endif
       }
     }
     m_bufPos = 0;
@@ -515,13 +559,19 @@ bool Device::read(symbol_t* value, bool isAvailable, ArbitrationState* arbitrati
       return false;
     }
 #ifdef DEBUG_RAW_TRAFFIC
-    fprintf(stdout, "raw <");
+    fprintf(stdout, "raw %ld+%ld <", m_bufLen, size);
     for (int pos=0; pos < size; pos++) {
-      fprintf(stdout, " %2.2x", m_buffer[m_bufLen+pos]);
+      fprintf(stdout, " %2.2x", m_buffer[(m_bufLen+pos)%m_bufSize]);
     }
     fprintf(stdout, "\n");
+    fflush(stdout);
 #endif
     m_bufLen += size;
+  }
+  if (m_enhancedProto) {
+    if (handleEnhancedBufferedData(value, arbitrationState)) {
+      return true;
+    }
   }
   if (!available()) {
     if (incomplete) {
@@ -535,6 +585,10 @@ bool Device::read(symbol_t* value, bool isAvailable, ArbitrationState* arbitrati
     m_bufLen--;
     return true;
   }
+  return handleEnhancedBufferedData(value, arbitrationState);
+}
+
+bool Device::handleEnhancedBufferedData(symbol_t* value, ArbitrationState* arbitrationState) {
   while (m_bufLen > 0) {
     symbol_t ch = m_buffer[m_bufPos];
     if (!(ch&ENH_BYTE_FLAG)) {
@@ -574,7 +628,7 @@ bool Device::read(symbol_t* value, bool isAvailable, ArbitrationState* arbitrati
           m_listener->notifyDeviceData(data, false);
         }
         m_arbitrationMaster = SYN;
-        m_arbitrationCheck = false;
+        m_arbitrationCheck = 0;
         *value = data;
         return true;
       case ENH_RES_FAILED:
@@ -583,53 +637,97 @@ bool Device::read(symbol_t* value, bool isAvailable, ArbitrationState* arbitrati
           m_listener->notifyDeviceData(m_arbitrationMaster, false);
         }
         m_arbitrationMaster = SYN;
-        m_arbitrationCheck = false;
+        m_arbitrationCheck = 0;
         *value = data;
         return true;
       case ENH_RES_RECEIVED:
         *value = data;
+        if (data == SYN && *arbitrationState == as_running && m_arbitrationCheck) {
+          if (m_arbitrationCheck < 3) {  // wait for three SYN symbols before switching to timeout
+            m_arbitrationCheck++;
+          } else {
+            *arbitrationState = as_timeout;
+            m_arbitrationMaster = SYN;
+            m_arbitrationCheck = 0;
+          }
+        }
         return true;
       case ENH_RES_RESETTED:
         if (*arbitrationState != as_none) {
           *arbitrationState = as_error;
           m_arbitrationMaster = SYN;
-          m_arbitrationCheck = false;
+          m_arbitrationCheck = 0;
         }
+        m_enhInfoTemperature = "";
+        m_enhInfoSupplyVoltage = "";
+        m_enhInfoBusVoltage = "";
+        m_infoId = 0xff;
         m_extraFatures = data;
+        if (m_resetRequested) {
+          m_resetRequested = false;
+          if (m_extraFatures&0x01) {
+            sendEnhancedInfoRequest(0);  // request version, ignore result
+          }
+        } else {
+          close();  // on self-reset of device close and reopen it to have a clean startup
+          cancelRunningArbitration(arbitrationState);
+        }
         if (m_listener != nullptr) {
           m_listener->notifyStatus(false, (m_extraFatures&0x01) ? "reset, supports info" : "reset");
         }
         break;
       case ENH_RES_INFO:
         if (m_infoLen == 0) {
-          if (data<=16) { // max length
-            m_infoLen = data;
-            m_infoPos = 0;
-          }
-        } else if (m_infoPos < m_infoLen) {
+          m_infoLen = data;
+          m_infoPos = 0;
+        } else if (m_infoPos < m_infoLen && m_infoPos < sizeof(m_infoBuf)) {
           m_infoBuf[m_infoPos++] = data;
           if (m_infoPos >= m_infoLen) {
             unsigned int val;
             ostringstream stream;
-            switch ((m_infoLen<<8) | m_infoId) {
+            switch ((m_infoLen << 8) | m_infoId) {
               case 0x0200:
-                stream << "firmware " << static_cast<unsigned>(m_infoBuf[0]) << "." << std::hex << static_cast<unsigned>(m_infoBuf[1]);
+              case 0x0500:  // with firmware version and jumper info
+              case 0x0800:  // with firmware version, jumper info, and bootloader version
+                stream << static_cast<unsigned>(m_infoBuf[0]) << "."  // version minor
+                       << std::hex << static_cast<unsigned>(m_infoBuf[1]);  // features mask
+                if (m_infoLen >= 5) {
+                  stream << "[" << std::setfill('0') << std::setw(2) << std::hex << static_cast<unsigned>(m_infoBuf[2])
+                         << std::setw(2) << static_cast<unsigned>(m_infoBuf[3]) << "]";
+                }
+                if (m_infoLen >= 8) {
+                  stream << "." << std::dec << static_cast<unsigned>(m_infoBuf[5]);
+                  stream << "[" << std::setfill('0') << std::setw(2) << std::hex << static_cast<unsigned>(m_infoBuf[6])
+                         << std::setw(2) << static_cast<unsigned>(m_infoBuf[7]) << "]";
+                }
+                m_enhInfoVersion = stream.str();
+                stream.str(" ");
+                stream << "firmware " << m_enhInfoVersion;
+                if (m_infoLen >= 5) {
+                  stream << ", jumpers 0x" << std::setw(2) << static_cast<unsigned>(m_infoBuf[4]);
+                }
+                stream << std::setfill(' ');  // reset
                 break;
               case 0x0901:
               case 0x0802:
                 stream << (m_infoId == 1 ? "ID" : "config");
                 stream << std::hex << std::setfill('0');
-                for (uint8_t pos = 0; pos<m_infoPos; pos++) {
+                for (uint8_t pos = 0; pos < m_infoPos; pos++) {
                   stream << " " << std::setw(2) << static_cast<unsigned>(m_infoBuf[pos]);
+                }
+                if (m_infoId == 2 && (m_infoBuf[2]&0x3f) != 0x3f) {
+                  // non-default arbitration delay
+                  val = (m_infoBuf[2]&0x3f)*10;  // steps of 10us
+                  stream << ", arbitration delay " << std::dec << static_cast<unsigned>(val) << " us";
                 }
                 break;
               case 0x0203:
-                val = (static_cast<unsigned>(m_infoBuf[0])<<8) | static_cast<unsigned>(m_infoBuf[1]);
+                val = (static_cast<unsigned>(m_infoBuf[0]) << 8) | static_cast<unsigned>(m_infoBuf[1]);
                 stream << "temperature " << static_cast<unsigned>(val) << " °C";
                 m_enhInfoTemperature = stream.str();
                 break;
               case 0x0204:
-                val = (static_cast<unsigned>(m_infoBuf[0])<<8) | static_cast<unsigned>(m_infoBuf[1]);
+                val = (static_cast<unsigned>(m_infoBuf[0]) << 8) | static_cast<unsigned>(m_infoBuf[1]);
                 stream << "supply voltage " << static_cast<unsigned>(val) << " mV";
                 m_enhInfoSupplyVoltage = stream.str();
                 break;
@@ -639,15 +737,38 @@ bool Device::read(symbol_t* value, bool isAvailable, ArbitrationState* arbitrati
                        << static_cast<float>(m_infoBuf[0] / 10.0) << " V";
                 m_enhInfoBusVoltage = stream.str();
                 break;
+              case 0x0206:
+                stream << "reset cause ";
+                if (m_infoBuf[0]) {
+                  stream << static_cast<unsigned>(m_infoBuf[0]) << "=";
+                  switch (m_infoBuf[0]) {
+                    case 1: stream << "power-on"; break;
+                    case 2: stream << "brown-out"; break;
+                    case 3: stream << "watchdog"; break;
+                    case 4: stream << "clear"; break;
+                    case 5: stream << "reset"; break;
+                    case 6: stream << "stack"; break;
+                    case 7: stream << "memory"; break;
+                    default: stream << "other"; break;
+                  }
+                  stream << ", restart count " << static_cast<unsigned>(m_infoBuf[1]);
+                } else {
+                  stream << "unknown";
+                }
+                break;
               default:
-                stream << "unknown 0x" << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(m_infoId)
-                       << ", len " << std::dec << std::setw(0) << static_cast<unsigned>(m_infoPos);
+                stream << "unknown 0x" << std::hex << std::setfill('0') << std::setw(2)
+                       << static_cast<unsigned>(m_infoId) << ", len " << std::dec << std::setw(0)
+                       << static_cast<unsigned>(m_infoPos);
                 break;
             }
             m_listener->notifyStatus(false, ("extra info: "+stream.str()).c_str());
             m_infoLen = 0;
             m_infoId = 0xff;
           }
+        } else {
+          m_infoLen = 0;  // reset on invalid response
+          m_infoId = 0xff;
         }
         break;
       case ENH_RES_ERROR_EBUS:
@@ -733,7 +854,7 @@ result_t SerialDevice::open() {
   // create new settings
   memset(&newSettings, 0, sizeof(newSettings));
 
-  cfsetspeed(&newSettings, m_enhancedProto ? B9600 : B2400);
+  cfsetspeed(&newSettings, m_enhancedProto ? (m_enhancedHighSpeed ? B115200 : B9600) : B2400);
   newSettings.c_cflag |= (CS8 | CLOCAL | CREAD);
   newSettings.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);  // non-canonical mode
   newSettings.c_iflag |= IGNPAR;  // ignore parity errors
@@ -776,61 +897,13 @@ void SerialDevice::checkDevice() {
   }
 }
 
-#ifdef __CYGWIN__
-  #ifndef TCP_KEEPCNT
-    #define TCP_KEEPCNT 8
-  #endif
-  #ifndef TCP_KEEPINTVL
-    #define TCP_KEEPINTVL 150
-  #endif
-  #ifndef TCP_KEEPIDLE
-    #define TCP_KEEPIDLE 14400
-  #endif
-#endif
-
 result_t NetworkDevice::open() {
   result_t result = Device::open();
   if (result != RESULT_OK) {
     return result;
   }
-  struct sockaddr_in address;
-  memset(reinterpret_cast<char*>(&address), 0, sizeof(address));
-  if (inet_aton(m_hostOrIp, &address.sin_addr) == 0) {
-    struct hostent* h = gethostbyname(m_hostOrIp);
-    if (h == nullptr) {
-      return RESULT_ERR_GENERIC_IO;  // invalid host
-    }
-    memcpy(&address.sin_addr, h->h_addr_list[0], h->h_length);
-  }
-  address.sin_family = AF_INET;
-  address.sin_port = (in_port_t)htons(m_port);
-
-  m_fd = socket(AF_INET, m_udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+  m_fd = socketConnect(m_hostOrIp, m_port, m_udp, nullptr, 5, 2);  // wait up to 5 seconds for established connection
   if (m_fd < 0) {
-    return RESULT_ERR_GENERIC_IO;
-  }
-  int ret;
-  if (m_udp) {
-    struct sockaddr_in bindAddress = address;
-    bindAddress.sin_addr.s_addr = INADDR_ANY;
-    ret = bind(m_fd, (struct sockaddr*)&bindAddress, sizeof(address));
-  } else {
-    int value = 1;
-    ret = setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<void*>(&value), sizeof(value));
-    value = 1;
-    setsockopt(m_fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<void*>(&value), sizeof(value));
-    value = 3;  // send keepalive after 3 seconds of silence
-    setsockopt(m_fd, IPPROTO_TCP, TCP_KEEPIDLE, reinterpret_cast<void*>(&value), sizeof(value));
-    value = 2;  // send keepalive in interval of 2 seconds
-    setsockopt(m_fd, IPPROTO_TCP, TCP_KEEPINTVL, reinterpret_cast<void*>(&value), sizeof(value));
-    value = 2;  // drop connection after 2 failed keep alive sends
-    setsockopt(m_fd, IPPROTO_TCP, TCP_KEEPCNT, reinterpret_cast<void*>(&value), sizeof(value));
-  }
-  if (ret >= 0) {
-    ret = connect(m_fd, (struct sockaddr*)&address, sizeof(address));
-  }
-  if (ret < 0) {
-    close();
     return RESULT_ERR_GENERIC_IO;
   }
   if (!m_udp) {

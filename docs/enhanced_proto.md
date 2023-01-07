@@ -1,6 +1,7 @@
 ## Transfer speed
 
-In order to compensate potential overhead of transfer encoding, the transfer speed is set to 9600 Baud with 8 bits, no parity, and 1 stop bit.
+In order to compensate potential overhead of transfer encoding, the transfer speed is set to 9600 Baud or 115200 Baud
+with 8 bits, no parity, and 1 stop bit.
 
 
 ## Protocol
@@ -95,25 +96,29 @@ These are the predefined symbols as used above.
  * STARTED 0x2
  * INFO 0x3
  * FAILED 0xa
+ * ERROR_EBUS 0xb
+ * ERROR_HOST 0xc
 
 ### Error codes (from interface to ebusd)
  * ERR_FRAMING 0x00: framing error
  * ERR_OVERRUN 0x01: buffer overrun error
 
 ### Feature bits (both directions)
- * bit 7-1: tbd
- * bit 2: full message sending (complete sequence instead of single bytes)
- * bit 1: high speed transfer at 115200 Bd  
-   When requested, the UART speed is changed to 115200 Bd immediately after sending the complete RESETTED reponse.
+ * bit 7-2: tbd
+ * // planned: bit 1: full message sending (complete sequence instead of single bytes)
  * bit 0: additional infos (version, PIC ID, etc.)
 
 ### Information IDs (both directions)
 The first level below is the `info_id` value and the second level describes the response data byte sequence.
 The first byte transferred in response is always the number of data bytes to be transferred (excluding the length itself).
  * 0x00: version  
-   * `length`: =2
+   * `length`: =8 (2 before 20220220, 5 before 20220831)
    * `version`: version number
-   * `features`: feature bits
+   * `features`: feature bits (see above)
+   * `checksum_H` `checksum_L`: checksum (since 20220220)
+   * `jumpers`: jumper settings (0x01=enhanced, 0x02=high speed, 0x04=Ethernet, 0x08=WIFI, 0x10=v3.1, 0x20=ignore hard jumpers)
+   * `bootloader_version`: bootloader version (since 20220831)
+   * `bootloader_checksum_H` `bootloader_checksum_L`: bootloader checksum
  * 0x01: PIC ID
    * `length`: =9
    * 9*`mui`: PIC MUI
@@ -121,8 +126,8 @@ The first byte transferred in response is always the number of data bytes to be 
    * `length`: =8
    * 8*`config_H` `config_L`: PIC config
  * 0x03: PIC temperature
-   * `length`: =1
-   * `temp`: temperature in degrees Celsius
+   * `length`: =2
+   * `temp_H` `temp_L`: temperature in degrees Celsius
  * 0x04: PIC supply voltage
    * `length`: =2
    * `millivolt_H` `millivolt_L`: voltage value in mV
@@ -130,4 +135,7 @@ The first byte transferred in response is always the number of data bytes to be 
    * `length`: =2
    * `voltage_max`: maximum bus voltage in 10th volts
    * `voltage_min`: minimum bus voltage in 10th volts
-
+ * 0x06: reset info (since 20220831)
+   * `length`: =2
+   * `reset_cause`: reset cause (1=power-on, 2=brown-out, 3=watchdog, 4=clear, 5=reset, 6=stack, 7=memory)
+   * `restart_count`: restart count (within same power cycle)

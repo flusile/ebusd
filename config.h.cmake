@@ -7,6 +7,15 @@
 /* Defined if MQTT handling is enabled. */
 #cmakedefine HAVE_MQTT
 
+/* Defined if KNX handling is enabled. */
+#cmakedefine HAVE_KNX
+
+/* Defined if KNX handling via knxd is enabled. */
+#cmakedefine HAVE_KNXD
+
+/* Defined if SSL is enabled. */
+#cmakedefine HAVE_SSL
+
 /* Defined if ppoll() is available. */
 #cmakedefine HAVE_PPOLL
 
@@ -57,3 +66,9 @@
 
 /* The version of the package. */
 #cmakedefine VERSION "${VERSION}"
+
+/* The major version of the package. */
+#cmakedefine PACKAGE_VERSION_MAJOR ${PACKAGE_VERSION_MAJOR}
+
+/* The minor version of the package. */
+#cmakedefine PACKAGE_VERSION_MINOR ${PACKAGE_VERSION_MINOR}

@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2014-2021 John Baier <ebusd@ebusd.eu>, Roland Jax 2012-2014 <ebusd@liwest.at>
+ * Copyright (C) 2014-2022 John Baier <ebusd@ebusd.eu>, Roland Jax 2012-2014 <ebusd@liwest.at>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -129,9 +129,10 @@ class WaitThread : public Thread {
   /**
    * Wait for the specified amount of time.
    * @param seconds the number of seconds to wait.
+   * @param millis the optional number of milliseconds to wait.
    * @return true if this @a WaitThread is still running and not yet stopped.
    */
-  bool Wait(int seconds);
+  bool Wait(int seconds, int millis = 0);
 
 
  protected:

@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2014-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2014-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -424,6 +424,11 @@ class BusHandler : public WaitThread {
   }
 
   /**
+   * @return the @a Device instance for accessing the bus.
+   */
+  const Device* getDevice() const { return m_device; }
+
+  /**
    * Clear stored values (e.g. scan results).
    */
   void clear();
@@ -603,9 +608,10 @@ class BusHandler : public WaitThread {
   /**
    * Get the next slave address that still needs to be scanned or loaded.
    * @param lastAddress the last returned slave address, or 0 for returning the first one.
+   * @param withUnfinished whether to include slave addresses that were not scanned yet.
    * @return the next slave address that still needs to be scanned or loaded, or @a SYN.
    */
-  symbol_t getNextScanAddress(symbol_t lastAddress) const;
+  symbol_t getNextScanAddress(symbol_t lastAddress, bool withUnfinished) const;
 
   /**
    * Set the state of the participant to configuration @a LOADED.

@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2015-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2015-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -42,6 +42,12 @@ void clockGettime(struct timespec* t) {
 #else
   clock_gettime(CLOCK_REALTIME, t);
 #endif
+}
+
+uint64_t clockGetMillis() {
+  struct timespec t;
+  clockGettime(&t);
+  return t.tv_sec*1000LL + t.tv_nsec / 1000000;
 }
 
 }  // namespace ebusd

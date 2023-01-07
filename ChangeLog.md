@@ -1,13 +1,91 @@
-# 21.4 (tbd)
+# 23.1 (2022-12-06)
+## Bug Fixes
+* fix potentially invalid settings picked up from environment variables
+* fix potentially unnecessary arbitration start for non-enhanced proto
+* fix smaller issues in KNX integration
+* fix numeric replacement+infinite and float min/max values in MQTT JSON payload format
+* fix duplicate definition sent for same message when writable messages are included in MQTT integration
+* fix UDP based devices no longer working since 22.4
+* fix for older SSL libraries not automatically retrying if necessary
+* fix enhanced side data transfer from device to host
+* fix for fast participants starting immediately after own SYN at the end of a sent command
+* add a single retry when initial config location check fails
+
+## Features
+* add support for setting visual ping, IP gateway, MAC from ID, and variant to ebuspicloader
+* add step variable for numeric values to message definition in MQTT integration
+* add yes/no values and writable heating curve to Home Assistant MQTT discovery integration
+* add device version to update check and switch to Home Assistant update integration for current update check and additionally for device
+* add preferred language support to web services and use it instead of default LANG environment with fallback to German
+* add option to exit non-zero on non-success response from ebusd to ebusctl
+
+
+# 22.4 (2022-09-18)
+## Bug Fixes
+* fix some smaller glitches (short argument names, compilation on small devices, argument help)
+* fix revision in gh build for update check
+* fix for include instruction without subdirectory
+* add timeout to network device connection
+
+## Features
+* add continuation to initial scan until succeeded as well as repetition to incomplete regular scan
+* add restart of enhanced device state when connection was reset
+* add KNX integration via KNXnet/IP multicast routing and optionally via knxd client
+
+
+# 22.3 (2022-05-08)
+## Bug Fixes
+* fix potential race condition in connection handling
+* fix ebusctl final read
+* fix missing MQTT topic prefix with "--mqttint=..."
+* fix weird SSL connect errors
+* fix for /decode endpoint
+* fix for Home Assistant MQTT discovery config to truncate long updatecheck string
+
+## Features
+* add timeout check to arbitration
+* add allow using older libmosquitto version
+* add "isreverse" to /datatype endpoint
+* add high speed serial mode to enhanced protocol
+* add support for flashing via network to ebuspicloader
+* add allow using "--mqttvar=..." multiple times to ease overriding integration settings
+
+
+# 22.2 (2022-02-27)
+## Bug Fixes
+* fix for reconnect in HTTPS client
+* fix for potentially truncated float representation
+* fix for unmatchable incoming MQTT topics
+* fix for non-JSON MQTT payload format
+
+## Features
+* add "--cafile" and "--capath" options with support for insecure HTTPS connections
+* add support for extra infos of current adapter 3 firmware
+* add option to send message dump to a file
+* add "--mqttjson=short" option for smaller message payload
+* add negative filtering to MQTT integration
+* add rewrite outdated config path with the new one
+
+
+# 22.1 (2022-02-12)
 ## Bug Fixes
 * fix smaller bugs related to cleanup
 * add more device latency to unix build
+* fix for debian package overwriting previous conf files
+* fix for potentially truncated float representation
+* fix for determining unique field names in a message
 
 ## Features
 * added arbitration delay setting to ebuspicloader
 * updated new location of config and update check web service
 * remove ebusfeed from regular build
 * add support for picking up environment variables as command line options
+* add support for generic MQTT integration by allowing publish of message definition content
+* add support for Home Assistant MQTT discovery feature
+* add Alpine Linux APKBUILD (thanks to tim-devel)
+* add QoS setting and adjustable global topic to MQTT
+* add option to move dynamic circuit and name parts to MQTT payload allowing to push to e.g. Azure IoT hub
+* add SSL support to HTTP client
 
 
 # 21.3 (2021-11-07)

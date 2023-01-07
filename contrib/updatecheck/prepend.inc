@@ -16,7 +16,7 @@ function readVersions($old=false) {
     array_walk($v, $func);
   }
 }
-function checkUpdate($ebusdVersion, $ebusdRelease, $architecture, $loadedFiles) {
+function checkUpdate($ebusdVersion, $ebusdRelease, $architecture, $deviceVersion, $loadedFiles, $language) {
   if (!$ebusdVersion) {
     return 'invalid request';
   }
@@ -30,13 +30,21 @@ function checkUpdate($ebusdVersion, $ebusdRelease, $architecture, $loadedFiles) 
   } else {
     $ret = 'version '.$versions['ebusd'][0].' available';
   }
+  if ($deviceVersion && @$versions['device']) {
+    $feat = strtok($deviceVersion, '.');
+    $ver = strtok('.');
+    if ($ver && $ver!==$versions['device'][0]) {
+      $ret .= ', device firmware '.$versions['device'][0].' available';
+    }
+  }
   $newerAvailable = 0;
   $configs = '';
+  $offset = $language==='en' ? 3 : 0;
   foreach ($loadedFiles as $k => $val) {
     $v = $versions[$k];
     if ($v) {
-      $newer = $v[2]>$val['t'];
-      if ($v[0]!=$val['h'] || $v[1]!=$val['s']) {
+      $newer = $v[2+$offset]>$val['t'];
+      if ($v[0+$offset]!=$val['h'] || $v[1+$offset]!=$val['s']) {
         if ($newer) {
           $newerAvailable++;
         }

@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2020-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2020-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,10 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <dirent.h>
 #include <time.h>
 #include <termios.h>
@@ -33,29 +37,50 @@
 #include <string>
 #include <cstring>
 #include "intelhex/intelhexclass.h"
+#include "lib/utils/tcpsocket.h"
 
+using ebusd::socketConnect;
 
 /** the version string of the program. */
 const char *argp_program_version = "eBUS adapter PIC firmware loader";
 
 /** the documentation of the program. */
 static const char argpdoc[] =
-    "A tool for loading firmware to the eBUS adapter PIC."
-    "\vPORT is the serial port to use (e.g./dev/ttyUSB0) also supporting a trailing wildcard '*' for testing multiple ports.";
+    "A tool for loading firmware to the eBUS adapter PIC and configure adjustable settings."
+    "\vPORT is either the serial port to use (e.g. "
+#ifdef __CYGWIN__
+    "/dev/ttyS0 for COM1 on Windows"
+#else
+    "/dev/ttyUSB0"
+#endif
+    ") that also supports a trailing wildcard '*' for testing"
+    " multiple ports, or a network port as \"ip:port\" for use with e.g. socat or ebusd-esp in PIC pass-through mode.";
 
 static const char argpargsdoc[] = "PORT";
 
 /** the definition of the known program arguments. */
 static const struct argp_option argpoptions[] = {
-    {"verbose", 'v', nullptr, 0, "enable verbose output", 0 },
-    {"dhcp",    'd', nullptr, 0, "set dynamic IP address via DHCP", 0 },
+    {nullptr,     0, nullptr, 0, "IP options:", 1 },
+    {"dhcp",    'd', nullptr, 0, "set dynamic IP address via DHCP (default)", 0 },
     {"ip",      'i', "IP",    0, "set fix IP address (e.g. 192.168.0.10)", 0 },
     {"mask",    'm', "MASK",  0, "set fix IP mask (e.g. 24)", 0 },
+    {"gateway", 'g', "GW",    0, "set fix IP gateway to GW (if necessary and other than net address + 1)", 0 },
     {"macip",   'M', nullptr, 0, "set the MAC address suffix from the IP address", 0 },
+    {"macid",   'N', nullptr, 0, "set the MAC address suffix from internal ID (default)", 0 },
+    {nullptr,     0, nullptr, 0, "eBUS options:", 2 },
     {"arbdel",  'a', "US",    0, "set arbitration delay to US microseconds (0-620 in steps of 10, default 200"
                                  ", since firmware 20211128)", 0 },
+    {nullptr,     0, nullptr, 0, "PIC options:", 3 },
+    {"pingon",  'p', nullptr, 0, "enable visual ping (default)", 0 },
+    {"pingoff", 'o', nullptr, 0, "disable visual ping", 0 },
+    {"variant", -3, "VARIANT", 0, "set the VARIANT to U=USB/RPI, W=WIFI, E=Ethernet,"
+                                 " N=non-enhanced USB/RPI/WIFI, F=non-enhanced Ethernet"
+                                 " (lowercase to allow hardware jumpers, default \"u\""
+                                 ", since firmware 20221206)", 0 },
     {"flash",   'f', "FILE",  0, "flash the FILE to the device", 0 },
     {"reset",   'r', nullptr, 0, "reset the device at the end on success", 0 },
+    {nullptr,     0, nullptr, 0, "Tool options:", 9 },
+    {"verbose", 'v', nullptr, 0, "enable verbose output", 0 },
     {"slow",    's', nullptr, 0, "use low speed for transfer", 0 },
     {nullptr,          0,        nullptr,    0, nullptr, 0 },
 };
@@ -65,10 +90,18 @@ static bool setDhcp = false;
 static bool setIp = false;
 static uint8_t setIpAddress[] = {0, 0, 0, 0};
 static bool setMacFromIp = false;
+static bool setMacFromIpValue = true;
 static bool setMask = false;
 static uint8_t setMaskLen = 0x1f;
+static bool setGateway = false;
+uint32_t setGatewayBits = 0;
 static bool setArbitrationDelay = false;
 static uint16_t setArbitrationDelayMicros = 0;
+static bool setVisualPing = false;
+static bool setVisualPingOn = false;
+static bool setVariant = false;
+static uint8_t setVariantValue = 0;
+static bool setVariantForced = false;
 static char* flashFile = nullptr;
 static bool reset = false;
 static bool lowSpeed = false;
@@ -107,12 +140,13 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
   char *ip = nullptr, *part = nullptr;
   int pos = 0, sum = 0;
   struct stat st;
+  uint32_t hostBits = 0;
   switch (key) {
     case 'v':  // --verbose
       verbose = true;
       break;
     case 'd':  // --dhcp
-      if (setIp || setMask) {
+      if (setIp || setMask || setGateway) {
         argp_error(state, "either DHCP or IP address is needed");
         return EINVAL;
       }
@@ -125,6 +159,10 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
       }
       if (setDhcp) {
         argp_error(state, "either DHCP or IP address is needed");
+        return EINVAL;
+      }
+      if (setIp) {
+        argp_error(state, "IP address was specified twice");
         return EINVAL;
       }
       ip = strdup(arg);
@@ -144,7 +182,7 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
       }
       setIp = true;
       break;
-    case 'm': // --mask=24
+    case 'm':  // --mask=24
       if (arg == nullptr || arg[0] == 0) {
         argp_error(state, "invalid IP mask");
         return EINVAL;
@@ -153,16 +191,100 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
         argp_error(state, "either DHCP or IP address is needed");
         return EINVAL;
       }
-      if (!parseByte(arg, 0, 0x1e, &setMaskLen)) {
+      if (setMask) {
+        argp_error(state, "mask was specified twice");
+        return EINVAL;
+      }
+      if (!parseByte(arg, 1, 0x1e, &setMaskLen)) {
         argp_error(state, "invalid IP mask");
         return EINVAL;
       }
       setMask = true;
       break;
-    case 'M': // --macip
+    case 'g':  // --gateway=192.168.0.11
+      if (arg == nullptr || arg[0] == 0) {
+        argp_error(state, "invalid gateway");
+        return EINVAL;
+      }
+      if (setDhcp) {
+        argp_error(state, "either DHCP or IP address is needed");
+        return EINVAL;
+      }
+      if (!setIp || !setMask) {
+        argp_error(state, "IP and mask need to be specified before gateway");
+        return EINVAL;
+      }
+      ip = strdup(arg);
+      part = strtok(ip, ".");
+      setGatewayBits = 0;
+      hostBits = 0;
+      for (pos=0; part && pos < 4; pos++) {
+        uint8_t address = 0;
+        if (!parseByte(part, 0, 255, &address)) {
+          break;
+        }
+        sum += address;
+        part = strtok(nullptr, ".");
+        uint8_t maskRemain = setMaskLen-pos*8;
+        uint8_t mask = maskRemain >= 8 ? 255 : maskRemain == 0 ? 0 : (255^((1 << (8 - maskRemain)) - 1));
+        if ((address & mask) != (setIpAddress[pos] & mask)) {
+          argp_error(state, "invalid gateway (different network)");
+          free(ip);
+          return EINVAL;
+        }
+        setGatewayBits = (setGatewayBits << 8) | (address & ~mask);
+        hostBits = (hostBits << 8) | (setIpAddress[pos] & ~mask);
+      }
+      free(ip);
+      if (pos != 4 || part || sum == 0 || setGatewayBits == 0) {
+        argp_error(state, "invalid gateway");
+        return EINVAL;
+      }
+      if (setGatewayBits == hostBits) {
+        argp_error(state, "invalid gateway (same as address)");
+        return EINVAL;
+      }
+      if (!setGatewayBits || setGatewayBits == ((1 << (32 - setMaskLen)) - 1)) {
+        argp_error(state, "invalid gateway (net or broadcast address)");
+        return EINVAL;
+      }
+      if (setGatewayBits == 1) {  // default
+        setGatewayBits = 0x3f;
+        setGateway = true;
+        break;
+      }
+      if (setMaskLen >= 27) {
+        // fine: all bits are available
+        setGateway = true;
+        break;
+      }
+      if (!(setGatewayBits >> 5)) {
+        if (!(setGatewayBits & 0x1f)) {
+          argp_error(state, "invalid gateway (net address)");
+          return EINVAL;
+        }
+        // fine: host part above max gateway adjustable bits is the same and remainder non-zero
+        setGatewayBits &= 0x1f;
+        setGateway = true;
+        break;
+      }
+      if ((setGatewayBits >> 5) == ((1<<((32-setMaskLen)-5))-1)) {
+        // fine: host part above max gateway adjustable bits is all 1
+        setGatewayBits = 0x20 | (setGatewayBits & 0x1f);
+        setGateway = true;
+        break;
+      }
+      argp_error(state, "invalid gateway (out of possible range of first/last 31 hosts in subnet)");
+      return EINVAL;
+    case 'M':  // --macip
       setMacFromIp = true;
+      setMacFromIpValue = true;
       break;
-    case 'a': // --arbdel=1000
+    case 'N':  // --macid
+      setMacFromIp = true;
+      setMacFromIpValue = false;
+      break;
+    case 'a':  // --arbdel=1000
       if (arg == nullptr || arg[0] == 0) {
         argp_error(state, "invalid arbitration delay");
         return EINVAL;
@@ -173,17 +295,47 @@ error_t parse_opt(int key, char *arg, struct argp_state *state) {
       }
       setArbitrationDelay = true;
       break;
-    case 'f': // --flash=firmware.hex
+    case 'p':  // --pingon
+      setVisualPing = true;
+      setVisualPingOn = true;
+      break;
+    case 'o':  // --pingoff
+      setVisualPing = true;
+      setVisualPingOn = false;
+      break;
+    case -3:  // --variant=U|W|E|F|N|u|w|e|f|n
+      if (arg == nullptr || arg[0] == 0) {
+        argp_error(state, "invalid variant");
+        return EINVAL;
+      }
+      if (arg[0] == 'u' || arg[0] == 'U') {
+        setVariantValue = 3;
+      } else if (arg[0] == 'w' || arg[0] == 'W') {
+        setVariantValue = 2;
+      } else if (arg[0] == 'e' || arg[0] == 'E') {
+        setVariantValue = 1;
+      } else if (arg[0] == 'f' || arg[0] == 'F') {
+        setVariantValue = 4;
+      } else if (arg[0] == 'n' || arg[0] == 'N') {
+        setVariantValue = 0;
+      } else {
+        argp_error(state, "invalid variant");
+        return EINVAL;
+      }
+      setVariantForced = arg[0]<'a';
+      setVariant = true;
+      break;
+    case 'f':  // --flash=firmware.hex
       if (arg == nullptr || arg[0] == 0 || stat(arg, &st) != 0 || !S_ISREG(st.st_mode)) {
         argp_error(state, "invalid flash file");
         return EINVAL;
       }
       flashFile = arg;
       break;
-    case 'r': // --reset
+    case 'r':  // --reset
       reset = true;
       break;
-    case 's': // --slow
+    case 's':  // --slow
       lowSpeed = true;
       break;
     default:
@@ -256,18 +408,16 @@ typedef union
 // size of boot block in bytes
 #define END_BOOT_BYTES (END_BOOT*2)
 
-long long getTime() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec*1000+ts.tv_nsec/1000000;
-}
+static bool isSerial = true;
+static int timeoutFactor = 1;
+static int timeoutAddend = 0;
 
 ssize_t waitWrite(int fd, uint8_t *data, size_t len, int timeoutMillis) {
   int ret;
   struct pollfd pfd;
   pfd.fd = fd;
   pfd.events = POLLOUT | POLLERR | POLLHUP;
-  ret = poll(&pfd, 1, timeoutMillis);
+  ret = poll(&pfd, 1, timeoutMillis*timeoutFactor + timeoutAddend);
   if (ret >= 0 && pfd.revents & (POLLERR | POLLHUP)) {
     return -1;
   }
@@ -293,7 +443,7 @@ ssize_t waitRead(int fd, uint8_t *data, size_t len, int timeoutMillis) {
   struct pollfd pfd;
   pfd.fd = fd;
   pfd.events = POLLIN | POLLERR | POLLHUP;
-  ret = poll(&pfd, 1, timeoutMillis);
+  ret = poll(&pfd, 1, timeoutMillis*timeoutFactor + timeoutAddend);
   if (ret >= 0 && pfd.revents & (POLLERR | POLLHUP)) {
     return -1;
   }
@@ -618,7 +768,7 @@ struct termios termios_original;
 
 int openSerial(std::string port) {
   // open serial port
-  int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);  // non-blocking IO: | O_NONBLOCK);
+  int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);  // non-blocking IO
   if (fd == -1) {
     std::cerr << "unable to open " << port << std::endl;
     return -1;
@@ -653,11 +803,26 @@ int openSerial(std::string port) {
     close(fd);
     return -1;
   }
+  std::cout << "opened " << port << std::endl;
   return fd;
 }
 
-void closeSerial(int fd) {
-  tcsetattr(fd, TCSANOW, &termios_original);
+int openNet(std::string host, uint16_t port) {
+  // open network port
+  int fd = socketConnect(host.c_str(), port, false, nullptr, 5);
+  if (fd < 0) {
+    std::cerr << "unable to open " << host << std::endl;
+    return -1;
+  }
+  fcntl(fd, F_SETFL, O_NONBLOCK);  // set non-blocking
+  std::cout << "opened " << host << ":" << static_cast<unsigned>(port) << std::endl;
+  return fd;
+}
+
+void closeConnection(int fd) {
+  if (isSerial) {
+    tcsetattr(fd, TCSANOW, &termios_original);
+  }
   close(fd);
 }
 
@@ -727,7 +892,7 @@ void printFileChecksum() {
   }
   std::cout
     << "New firmware version: " << static_cast<unsigned>(newFirmwareVersion)
-    << " [" << std::hex << std::setw (4) << std::setfill('0') << static_cast<signed>(checkSum) << "]" << std::endl;
+    << " [" << std::hex << std::setw(4) << std::setfill('0') << static_cast<signed>(checkSum) << "]" << std::endl;
 }
 
 bool flashPic(int fd) {
@@ -841,15 +1006,21 @@ bool flashPic(int fd) {
   return true;
 }
 
-void readSettings(int fd) {
+int readSettings(int fd, uint8_t* currentData = nullptr) {
   uint8_t mac[] = {0xae, 0xb0, 0x53, 0xef, 0xfe, 0xef};  // "Adapter-eBUS3" + (UserID or MUI)
   uint8_t ip[4] = {0, 0, 0, 0};
   bool useMUI = true;
   uint8_t maskLen = 0;
   uint8_t configData[8];
-  readConfig(fd, 0x0000, 8, false, false, configData);  // User ID
+  if (readConfig(fd, 0x0000, 8, false, false, configData) != 0) {  // User ID
+    return -1;
+  }
+  if (currentData) {
+    memcpy(currentData, configData, sizeof(configData));
+  }
   useMUI = (configData[1]&0x20) != 0;  // if highest bit is set, then use MUI. if cleared, use User ID
   maskLen = configData[1]&0x1f;
+  uint8_t gw = configData[7]&0x3f;
   for (int i=0; i < 4; i++) {
     ip[i] = configData[i*2];
     if (!useMUI && i > 0) {
@@ -871,52 +1042,118 @@ void readSettings(int fd) {
   }
   std::cout << std::endl;
   if (maskLen == 0x1f || (ip[0]|ip[1]|ip[2]|ip[3]) == 0) {
-    std::cout << "IP address: DHCP" << std::endl;
+    std::cout << "IP address: DHCP (default)" << std::endl;
   } else {
     std::cout << "IP address:";
-    for (int i=0; i < 4; i++) {
-      std::cout << (i == 0?' ':'.') << std::dec << static_cast<unsigned>(ip[i]);
+    for (uint8_t pos = 0, maskRemain = maskLen; pos < 4; pos++, maskRemain -= maskRemain >= 8 ? 8 : maskRemain) {
+      std::cout << (pos == 0?' ':'.') << std::dec << static_cast<unsigned>(ip[pos]);
+      uint8_t mask = maskRemain >= 8 ? 255 : maskRemain == 0 ? 0 : (255 ^ ((1 << (8 - maskRemain)) - 1));
+      ip[pos] &= mask;  // prepare for gateway
     }
-    std::cout << "/" << std::dec << static_cast<unsigned>(maskLen) << std::endl;
-    /*
+    std::cout << "/" << std::dec << static_cast<unsigned>(maskLen) << ", gateway:";
     // build gateway
-    for (uint8_t pos=0; pos < 4; pos++) {
-      mask[pos] = maskLen >= 8 ? 255 : maskLen<=0 ? 0 : (255^((1 << (8-maskLen))-1));
-      ip[pos] &= mask[pos];
-      maskLen = maskLen >= 8 ? maskLen-8 : 0;
+    if (gw == 0x3f) {
+      // default: first address in network is used as gateway
+      ip[3] |= 1;
+    } else if (gw & 0x20) {
+      // end of subnet
+      // non-mask bits outside of |gw reach
+      uint8_t mask = maskLen <= 24 ? 0 : (255^((1 << (8 - (maskLen-24))) - 1));
+      ip[3] |= ((~mask)^0x1f) | (gw&0x1f);
+      if (maskLen<24) {
+        // more than just the last IP byte are affected: set non-mask bits to 1 as well in bytes 0-2
+        for (uint8_t pos = 0, maskRemain = maskLen; pos < 3; pos++, maskRemain -= maskRemain >= 8 ? 8 : maskRemain) {
+          mask = maskRemain >= 8 ? 255 : maskRemain == 0 ? 0 : (255^((1 << (8 - maskRemain)) - 1));
+          ip[pos] |= ~mask;
+        }
+      }
+    } else {
+      // start of subnet
+      ip[3] |= gw&0x1f;
     }
-    ip[3] |= 1; // first address in network is used as gateway (not needed anyway))
-    std::cout << "IP gateway:";
     for (int i=0; i < 4; i++) {
       std::cout << (i == 0?' ':'.') << std::dec << static_cast<unsigned>(ip[i]);
     }
     std::cout << std::endl;
-    */
   }
   uint16_t arbitrationDelay = configData[3]&0x3f;
   std::cout << "Arbitration delay: ";
-  if (arbitrationDelay==0x3f) {
+  if (arbitrationDelay == 0x3f) {
     std::cout << "200 us (default)" << std::endl;
   } else {
-    arbitrationDelay *= 10; // steps of 10us
+    arbitrationDelay *= 10;  // steps of 10us
     std::cout << std::dec << static_cast<unsigned>(arbitrationDelay) << " us" << std::endl;
   }
+  std::cout << "Visual ping: ";
+  if (configData[5]&0x20) {
+    std::cout << "on (default)" << std::endl;
+  } else {
+    std::cout << "off" << std::endl;
+  }
+  std::cout << "Variant: "; // since firmware 20221206
+  switch (configData[5]&0x03) {
+    case 3:
+      std::cout << "USB/RPI";
+      break;
+    case 2:
+      std::cout << "WIFI";
+      break;
+    case 1:
+      std::cout << "Ethernet";
+      break;
+    default:
+      std::cout << "non-enhanced ";
+      if (maskLen) {
+        std::cout << "Ethernet";
+      } else {
+        std::cout << "USB/RPI/WIFI";
+      }
+  }
+  if (configData[5]&0x04) {
+    std::cout << ", allow hardware jumpers";
+  } else {
+    std::cout << ", ignore hardware jumpers";
+  }
+  if ((configData[5]&0x07)==0x07) {
+    std::cout << " (default)";
+  }
+  std::cout << std::endl;
+  return 0;
 }
 
-bool writeSettings(int fd) {
+bool writeSettings(int fd, uint8_t* currentData = nullptr) {
   std::cout << "Writing settings: ";
   uint8_t configData[] = {0xff, 0x3f, 0xff, 0x3f, 0xff, 0x3f, 0xff, 0x3f};
-  if (setMacFromIp) {
-    configData[1] &= ~0x20;  // set useMUI
+  if (currentData) {
+    memcpy(configData, currentData, sizeof(configData));
   }
-  configData[1] = (configData[1]&~0x1f) | (setMaskLen&0x1f);
-  if (setIp) {
+  if (setMacFromIp) {
+    configData[1] = (configData[1]&~0x20) | (setMacFromIpValue ? 0 : 0x20);  // set useMUI
+  }
+  if (setDhcp) {
+    configData[1] |= 0x1f;
+  } else if (setIp) {
+    if (setMask) {
+      configData[1] = (configData[1]&~0x1f) | (setMaskLen&0x1f);
+    }
     for (int i = 0; i < 4; i++) {
       configData[i * 2] = setIpAddress[i];
+    }
+    if (setGateway) {
+      configData[7] = setGatewayBits;
     }
   }
   if (setArbitrationDelay) {
     configData[3] = setArbitrationDelayMicros/10;
+  }
+  if (setVisualPing) {
+    configData[5] = (configData[5]&0x1f) | (setVisualPingOn?0x20:0);
+  }
+  if (setVariant) {
+    configData[5] = (configData[5]&0x38) | (setVariantForced?0:0x04) | (setVariantValue&0x03);
+    if (setVariantValue==0) {
+      configData[1] = (configData[1]&~0x1f); // set mask=0 to disable Ethernet
+    }
   }
   if (writeConfig(fd, 0x0000, 8, configData) != 0) {
     std::cerr << "failed" << std::endl;
@@ -953,8 +1190,22 @@ int main(int argc, char* argv[]) {
   }
   std::string port = argv[arg_index];
   std::string::size_type pos = port.find('*');
-  if (pos==std::string::npos || pos != port.length()-1) {
-    int fd = openSerial(argv[arg_index]);
+  if (pos == std::string::npos || pos != port.length()-1) {
+    int fd;
+    pos = port.find(':');
+    if (pos != std::string::npos) {
+      string host = port.substr(0, pos);
+      uint16_t portNum = 0;
+      if (!parseShort(port.substr(pos+1).c_str(), 1, 65535, &portNum)) {
+        exit(EXIT_FAILURE);
+      }
+      isSerial = false;
+      timeoutFactor = 2;
+      timeoutAddend = 100;
+      fd = openNet(host, portNum);
+    } else {
+      fd = openSerial(port);
+    }
     if (fd < 0) {
       exit(EXIT_FAILURE);
     }
@@ -962,14 +1213,14 @@ int main(int argc, char* argv[]) {
   }
 
   std::string::size_type sep = port.find_last_of('/');
-  std::string base = sep==std::string::npos ? "" : port.substr(0, sep);
+  std::string base = sep == std::string::npos ? "" : port.substr(0, sep);
   DIR* dir = opendir(base.c_str());
   if (!dir) {
     std::cerr << "Unable to open directory " << base << std::endl;
     exit(EXIT_FAILURE);
   }
 
-  std::string prefix = sep==std::string::npos ? port.substr(0, pos) : port.substr(sep + 1, pos - 1 - sep);
+  std::string prefix = sep == std::string::npos ? port.substr(0, pos) : port.substr(sep + 1, pos - 1 - sep);
   struct dirent* ent;
   while ((ent = readdir(dir))) {
     if (std::string(ent->d_name).substr(0, prefix.length()) != prefix) {
@@ -983,6 +1234,7 @@ int main(int argc, char* argv[]) {
       continue;
     }
     run(fd);
+    std::cout << std::endl;
   }
   return 0;
 }
@@ -990,7 +1242,7 @@ int main(int argc, char* argv[]) {
 int run(int fd) {
   // read version
   if (readVersion(fd, verbose) != 0) {
-    closeSerial(fd);
+    closeConnection(fd);
     return EXIT_FAILURE;
   }
   uint8_t data[0x10];
@@ -1024,7 +1276,7 @@ int run(int fd) {
     int picSum = calcChecksum(fd, 0x0000, END_BOOT_BYTES);
     std::cout
       << "Bootloader version: " << static_cast<unsigned>(bootloaderVersion)
-      << " [" << std::hex << std::setw (4) << std::setfill('0') << static_cast<signed>(picSum) << "]" << std::endl;
+      << " [" << std::hex << std::setw(4) << std::setfill('0') << static_cast<signed>(picSum) << "]" << std::endl;
   } else {
     std::cerr << "Bootloader version not found" << std::endl;
   }
@@ -1035,11 +1287,16 @@ int run(int fd) {
     int picSum = calcChecksum(fd, END_BOOT, END_FLASH_BYTES-END_BOOT_BYTES);
     std::cout
       << "Firmware version: " << static_cast<unsigned>(firmwareVersion)
-      << " [" << std::hex << std::setw (4) << std::setfill('0') << static_cast<signed>(picSum) << "]" << std::endl;
+      << " [" << std::hex << std::setw(4) << std::setfill('0') << static_cast<signed>(picSum) << "]" << std::endl;
   } else {
     std::cout << "Firmware version not found" << std::endl;
   }
-  readSettings(fd);
+  uint8_t currentConfigData[8];
+  bool useCurrentConfigData = true;
+  if (readSettings(fd, currentConfigData) != 0) {
+    std::cerr << "Settings could not be retrieved" << std::endl;
+    useCurrentConfigData = false;
+  }
   std::cout << std::endl;
   bool success = true;
   if (flashFile) {
@@ -1048,8 +1305,8 @@ int run(int fd) {
       success = false;
     }
   }
-  if (setIp || setDhcp || setArbitrationDelay) {
-    if (writeSettings(fd)) {
+  if (setMacFromIp || setIp || setDhcp || setArbitrationDelay || setVisualPing || setVariant) {
+    if (writeSettings(fd, useCurrentConfigData ? currentConfigData : nullptr)) {
       std::cout << "Settings changed to:" << std::endl;
       readSettings(fd);
     } else {
@@ -1061,6 +1318,6 @@ int run(int fd) {
     resetDevice(fd);
   }
 
-  closeSerial(fd);
+  closeConnection(fd);
   return 0;
 }

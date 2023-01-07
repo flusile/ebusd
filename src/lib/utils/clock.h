@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2015-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2015-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@
 #ifndef LIB_UTILS_CLOCK_H_
 #define LIB_UTILS_CLOCK_H_
 
+#include <stdint.h>
 #include <time.h>
 
 namespace ebusd {
@@ -30,6 +31,11 @@ namespace ebusd {
  * @param t the @a timespec in which to store the time.
  */
 void clockGettime(struct timespec* t);
+
+/**
+ * Get the current system time in milliseconds since the Epoch.
+ */
+uint64_t clockGetMillis();
 
 }  // namespace ebusd
 

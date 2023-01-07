@@ -7,12 +7,15 @@ if [[ "$1" == "-h" ]]; then
   exit 1
 fi
 archs=linux/amd64,linux/386,linux/arm/v7,linux/arm64
+if [[ -n "$LIMITARCH" ]]; then
+  archs=$(echo ",$archs," | sed -e "s#.*,\([^,/]*/$LIMITARCH\),.*#\1#")
+  echo "limiting to arch $archs"
+fi
 if [[ -z "$1" ]] || [[ "x$1" == "xrelease" ]]; then
   UPLOAD_URL=
 else
-  UPLOAD_URL="http://$1/ebusdreleaseupload.php"
+  UPLOAD_CREDENTIALS=${UPLOAD_CREDENTIALS:-'anonymous:build'}
 fi
-UPLOAD_CREDENTIALS='anonymous:build'
 version=`cat ../../VERSION`
 source='../..'
 images='bullseye'
@@ -24,6 +27,9 @@ if [[ -z "$1" ]]; then
   target=image
   outputFmt='-o type=docker,type=registry'
   tagsuffix=':devel'
+  if [[ -n "$GIT_BRANCH" ]] && [[ "x$GIT_BRANCH" != "xmaster" ]]; then
+    tagsuffix="$tagsuffix-$GIT_BRANCH"
+  fi
 elif [[ "x$1" = "xrelease" ]]; then
   namesuffix='.release'
   target=image
@@ -32,9 +38,13 @@ elif [[ "x$1" = "xrelease" ]]; then
   extratag="-t $tagprefix:latest"
 else
   namesuffix='.build'
-  target=build
+  target=deb
   images='bullseye buster stretch'
-  outputFmt=-q
+  if [[ -n "$LIMITIMG" ]]; then
+    images=$(echo " $images " | sed -e "s#.* \($LIMITIMG\) .*#\1#")
+    echo "limiting to image $images"
+  fi
+  outputFmt='-o out/%IMAGE%'
   tagsuffix=":v$version-prep"
 fi
 
@@ -42,7 +52,7 @@ for image in $images; do
   output=$(echo "$outputFmt"|sed -e "s#%IMAGE%#$image#g")
   docker buildx build \
     --target $target \
-    --progress pain \
+    --progress plain \
     --platform $archs \
     -f Dockerfile${namesuffix} \
     --build-arg "BASE_IMAGE=debian:$image" \
@@ -51,6 +61,7 @@ for image in $images; do
     --build-arg "UPLOAD_URL=$UPLOAD_URL" \
     --build-arg "UPLOAD_CREDENTIALS=$UPLOAD_CREDENTIALS" \
     --build-arg "UPLOAD_OS=$image" \
+    --build-arg "GIT_REVISION=$GIT_REVISION" \
     -t $tagprefix$tagsuffix \
     $extratag \
     $output \

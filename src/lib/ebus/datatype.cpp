@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2014-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2014-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,12 +34,68 @@
 namespace ebusd {
 
 using std::dec;
+using std::defaultfloat;
 using std::hex;
 using std::fixed;
 using std::setfill;
 using std::setprecision;
 using std::setw;
 using std::endl;
+using std::isfinite;
+
+
+float uintToFloat(unsigned int value, bool negative) {
+#ifdef HAVE_DIRECT_FLOAT_FORMAT
+#  if HAVE_DIRECT_FLOAT_FORMAT == 2
+  value = __builtin_bswap32(value);
+#  endif
+  auto* pval = reinterpret_cast<symbol_t*>(&value);
+  return *reinterpret_cast<float*>(pval);
+#else
+  int exp = (value >> 23) & 0xff;  // 8 bits, signed
+  if (exp == 0) {
+    return 0.0;
+  }
+  exp -= 127;
+  unsigned int sig = value & ((1 << 23) - 1);
+  float val = (1.0f + static_cast<float>(sig / exp2(23))) * static_cast<float>(exp2(exp));
+  if (negative) {
+    return -val;
+  }
+  return val;
+#endif
+}
+
+uint32_t floatToUint(float val) {
+#ifdef HAVE_DIRECT_FLOAT_FORMAT
+  auto* pval = reinterpret_cast<symbol_t*>(&val);
+  uint32_t value = *reinterpret_cast<uint32_t*>(pval);
+#  if HAVE_DIRECT_FLOAT_FORMAT == 2
+  return __builtin_bswap32(value);
+#  endif
+  return value;
+#else
+  if (val != 0) {
+    bool negative = val < 0;
+    if (negative) {
+      val = -val;
+    }
+    int exp = ilogb(val);
+    if (exp < -126 || exp > 127) {
+      return 0xffffffff;  // invalid value (NaN)
+    }
+    val = scalbln(val, -exp) - 1.0;
+    unsigned int sig = (unsigned int)(val * exp2(23));
+    exp += 127;
+    uint32_t value = (exp << 23) | sig;
+    if (negative) {
+      return value | 0x80000000;
+    }
+    return value;
+  }
+  return 0;
+#endif
+}
 
 
 bool DataType::dump(OutputFormat outputFormat, size_t length, bool appendDivisor, ostream* output) const {
@@ -49,6 +105,7 @@ bool DataType::dump(OutputFormat outputFormat, size_t length, bool appendDivisor
     if (outputFormat & OF_ALL_ATTRS) {
       *output << ", \"isadjustable\": " << (isAdjustableLength() ? "true" : "false");
       *output << ", \"isignored\": " << (isIgnored() ? "true" : "false");
+      *output << ", \"isreverse\": " << (hasFlag(REV) ? "true" : "false");
     }
     *output << ", \"length\": ";
     if (isAdjustableLength() && length == REMAIN_LEN) {
@@ -358,8 +415,8 @@ result_t DateTimeDataType::readSymbols(size_t offset, size_t length, const Symbo
           return RESULT_ERR_INVALID_POS;
         }
         // number of minutes since 01.01.2009
-        minutes |= symbol*(1<<(8*i));
-        if (i<3) {
+        minutes |= symbol*(1 << (8*i));
+        if (i < 3) {
           break;
         }
         int mjd = static_cast<int>(minutes/(24*60)) + 54832;  // 01.01.2009
@@ -423,7 +480,7 @@ result_t DateTimeDataType::writeSymbols(size_t offset, size_t length, istringstr
         if (length == 4 && i == 2 && !m_hasTime) {
           continue;  // skip weekday in between
         }
-        if (input->eof() || !getline(*input, token, m_hasTime && i==2 ? ' ' : '.')) {
+        if (input->eof() || !getline(*input, token, m_hasTime && i == 2 ? ' ' : '.')) {
           return RESULT_ERR_EOF;  // incomplete
         }
         if (!hasFlag(REQ) && token == NULL_VALUE) {
@@ -463,7 +520,7 @@ result_t DateTimeDataType::writeSymbols(size_t offset, size_t length, istringstr
               index = start + incr;
               i = 1;
               type = 1;
-              skip = true; // switch to second pass for parsing the time
+              skip = true;  // switch to second pass for parsing the time
             } else {
               // calculate local week day
               int daysSinceSunday = (mjd + 3) % 7;  // Sun=0
@@ -545,7 +602,7 @@ result_t DateTimeDataType::writeSymbols(size_t offset, size_t length, istringstr
         }
         break;
 
-      case 3: // date and time in store phase
+      case 3:  // date and time in store phase
         value = lastLast & 0xff;
         last = lastLast >> 8;
         break;
@@ -674,6 +731,10 @@ result_t NumberDataType::derive(int divisor, size_t bitCount, const NumberDataTy
   return RESULT_OK;
 }
 
+result_t NumberDataType::getMinMax(bool getMax, const OutputFormat outputFormat, ostream* output) const {
+  return readFromRawValue(getMax ? m_maxValue : m_minValue, outputFormat, output);
+}
+
 result_t NumberDataType::readRawValue(size_t offset, size_t length, const SymbolString& input,
                                       unsigned int* value) const {
   size_t start = 0, count = length;
@@ -725,13 +786,88 @@ result_t NumberDataType::readRawValue(size_t offset, size_t length, const Symbol
 result_t NumberDataType::readSymbols(size_t offset, size_t length, const SymbolString& input,
                                      OutputFormat outputFormat, ostream* output) const {
   unsigned int value = 0;
-  int signedValue;
 
   result_t result = readRawValue(offset, length, input, &value);
   if (result != RESULT_OK) {
     return result;
   }
-  *output << setw(0) << dec;  // initialize output
+  return readFromRawValue(value, outputFormat, output);
+}
+
+result_t NumberDataType::getFloatFromRawValue(unsigned int value, float* output) const {
+  if (!hasFlag(REQ) && value == m_replacement) {
+    return RESULT_EMPTY;
+  }
+
+  bool negative;
+  if (hasFlag(SIG)) {  // signed value
+    negative = (value & (1 << (m_bitCount - 1))) != 0;
+    if (!hasFlag(EXP)) {
+      if (negative) {  // negative signed value
+        if (value < m_minValue) {
+          return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+        }
+      } else if (value > m_maxValue) {
+        return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+      }
+    }
+  } else if (value < m_minValue || value > m_maxValue) {
+    return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+  } else {
+    negative = false;
+  }
+  int signedValue;
+  if (m_bitCount == 32) {
+    if (hasFlag(EXP)) {  // IEEE 754 binary32
+      float val = uintToFloat(value, negative);
+      if (!isfinite(val)) {
+        return RESULT_EMPTY;
+      }
+      if (val != 0.0) {
+        if (m_divisor < 0) {
+          val *= static_cast<float>(-m_divisor);
+          if (!isfinite(val)) {
+            // reached beyond infinity
+            return RESULT_ERR_OUT_OF_RANGE;
+          }
+        } else if (m_divisor > 1) {
+          val /= static_cast<float>(m_divisor);
+        }
+      }
+      *output = static_cast<float>(val);
+      return RESULT_OK;
+    }
+    if (!negative) {
+      if (m_divisor < 0) {
+        *output = static_cast<float>(value) * static_cast<float>(-m_divisor);
+      } else if (m_divisor <= 1) {
+        *output = static_cast<float>(value);
+      } else {
+        *output = static_cast<float>(value) / static_cast<float>(m_divisor);
+      }
+      return RESULT_OK;
+    }
+    signedValue = static_cast<int>(value);  // negative signed value
+  } else if (negative) {  // negative signed value
+    signedValue = static_cast<int>(value) - (1 << m_bitCount);
+  } else {
+    signedValue = static_cast<int>(value);
+  }
+  if (m_divisor < 0) {
+    *output = static_cast<float>(signedValue) * static_cast<float>(-m_divisor);
+  } else if (m_divisor <= 1) {
+    *output = static_cast<float>(signedValue);
+  } else {
+    *output = static_cast<float>(signedValue) / static_cast<float>(m_divisor);
+  }
+  return RESULT_OK;
+}
+
+result_t NumberDataType::readFromRawValue(unsigned int value,
+                                          OutputFormat outputFormat, ostream* output) const {
+  size_t length = (m_bitCount < 8) ? 1 : (m_bitCount/8);
+  // initialize output
+  *output << setw(0) << std::resetiosflags(output->flags()) << dec << std::skipws << setprecision(6);
 
   if (!hasFlag(REQ) && value == m_replacement) {
     if (outputFormat & OF_JSON) {
@@ -745,41 +881,25 @@ result_t NumberDataType::readSymbols(size_t offset, size_t length, const SymbolS
   bool negative;
   if (hasFlag(SIG)) {  // signed value
     negative = (value & (1 << (m_bitCount - 1))) != 0;
-    if (negative) {  // negative signed value
-      if (value < m_minValue) {
+    if (!hasFlag(EXP)) {
+      if (negative) {  // negative signed value
+        if (value < m_minValue) {
+          return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+        }
+      } else if (value > m_maxValue) {
         return RESULT_ERR_OUT_OF_RANGE;  // value out of range
       }
-    } else if (value > m_maxValue) {
-      return RESULT_ERR_OUT_OF_RANGE;  // value out of range
     }
   } else if (value < m_minValue || value > m_maxValue) {
     return RESULT_ERR_OUT_OF_RANGE;  // value out of range
   } else {
     negative = false;
   }
+  int signedValue;
   if (m_bitCount == 32) {
     if (hasFlag(EXP)) {  // IEEE 754 binary32
-      float val;
-#ifdef HAVE_DIRECT_FLOAT_FORMAT
-#  if HAVE_DIRECT_FLOAT_FORMAT == 2
-      value = __builtin_bswap32(value);
-#  endif
-      symbol_t* pval = reinterpret_cast<symbol_t*>(&value);
-      val = *reinterpret_cast<float*>(pval);
-#else
-      int exp = (value >> 23) & 0xff;  // 8 bits, signed
-      if (exp == 0) {
-        val = 0.0;
-      } else {
-        exp -= 127;
-        unsigned int sig = value & ((1 << 23) - 1);
-        val = (1.0f + static_cast<float>(sig / exp2(23))) * static_cast<float>(exp2(exp));
-        if (negative) {
-          val = -val;
-        }
-      }
-#endif
-      if (val != val) {  // !isnan(val)
+      float val = uintToFloat(value, negative);
+      if (!isfinite(val)) {
         if (outputFormat & OF_JSON) {
           *output << "null";
         } else {
@@ -790,6 +910,10 @@ result_t NumberDataType::readSymbols(size_t offset, size_t length, const SymbolS
       if (val != 0.0) {
         if (m_divisor < 0) {
           val *= static_cast<float>(-m_divisor);
+          if (!isfinite(val)) {
+            // reached beyond infinity
+            return RESULT_ERR_OUT_OF_RANGE;
+          }
         } else if (m_divisor > 1) {
           val /= static_cast<float>(m_divisor);
         }
@@ -884,6 +1008,75 @@ result_t NumberDataType::writeRawValue(unsigned int value, size_t offset, size_t
   return RESULT_OK;
 }
 
+result_t NumberDataType::getRawValueFromFloat(float val, unsigned int* output) const {
+  unsigned int value;
+  if (hasFlag(EXP)) {  // IEEE 754 binary32
+    double dvalue = val;
+    if (m_divisor < 0) {
+      dvalue /= -m_divisor;
+    } else if (m_divisor > 1) {
+      dvalue *= m_divisor;
+    }
+    value = floatToUint(static_cast<float>(dvalue));
+    if (value == 0xffffffff) {
+      return RESULT_ERR_INVALID_NUM;
+    }
+  } else {
+    if (m_divisor == 1) {
+      if (hasFlag(SIG)) {
+        long signedValue = static_cast<long>(val);  // TODO static_c?
+        if (signedValue < 0 && m_bitCount != 32) {
+          value = (unsigned int)(signedValue + (1 << m_bitCount));
+        } else {
+          value = (unsigned int)signedValue;
+        }
+      } else if (val < 0) {
+        return RESULT_ERR_INVALID_NUM;  // invalid value
+      } else {
+        value = static_cast<unsigned int>(val);
+      }
+    } else {
+      double dvalue = val;
+      if (m_divisor < 0) {
+        dvalue = round(dvalue / -m_divisor);
+      } else {
+        dvalue = round(dvalue * m_divisor);
+      }
+      int length = static_cast<int>(m_bitCount/8);
+      if (hasFlag(SIG)) {
+        if (dvalue < -exp2((8 * static_cast<double>(length)) - 1)
+            || dvalue >= exp2((8 * static_cast<double>(length)) - 1)) {
+          return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+        }
+        if (dvalue < 0 && m_bitCount != 32) {
+          value = static_cast<unsigned int>(dvalue + (1 << m_bitCount));
+        } else {
+          value = static_cast<unsigned int>(dvalue);
+        }
+      } else {
+        if (dvalue < 0.0 || dvalue >= exp2(8 * static_cast<double>(length))) {
+          return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+        }
+        value = (unsigned int)dvalue;
+      }
+    }
+
+    if (hasFlag(SIG)) {  // signed value
+      if ((value & (1 << (m_bitCount - 1))) != 0) {  // negative signed value
+        if (value < m_minValue) {
+          return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+        }
+      } else if (value > m_maxValue) {
+        return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+      }
+    } else if (value < m_minValue || value > m_maxValue) {
+      return RESULT_ERR_OUT_OF_RANGE;  // value out of range
+    }
+  }
+  *output = value;
+  return RESULT_OK;
+}
+
 result_t NumberDataType::writeSymbols(size_t offset, size_t length, istringstream* input,
                                       SymbolString* output, size_t* usedLength) const {
   unsigned int value;
@@ -905,33 +1098,10 @@ result_t NumberDataType::writeSymbols(size_t offset, size_t length, istringstrea
     } else if (m_divisor > 1) {
       dvalue *= m_divisor;
     }
-#ifdef HAVE_DIRECT_FLOAT_FORMAT
-    float val = static_cast<float>(dvalue);
-    symbol_t* pval = reinterpret_cast<symbol_t*>(&val);
-    value = *reinterpret_cast<int32_t*>(pval);
-#  if HAVE_DIRECT_FLOAT_FORMAT == 2
-    value = __builtin_bswap32(value);
-#  endif
-#else
-    value = 0;
-    if (dvalue != 0) {
-      bool negative = dvalue < 0;
-      if (negative) {
-        dvalue = -dvalue;
-      }
-      int exp = ilogb(dvalue);
-      if (exp < -126 || exp > 127) {
-        return RESULT_ERR_INVALID_NUM;  // invalid value
-      }
-      dvalue = scalbln(dvalue, -exp) - 1.0;
-      unsigned int sig = (unsigned int)(dvalue * exp2(23));
-      exp += 127;
-      value = (exp << 23) | sig;
-      if (negative) {
-        value |= 0x80000000;
-      }
+    value = floatToUint(static_cast<float>(dvalue));
+    if (value == 0xffffffff) {
+      return RESULT_ERR_INVALID_NUM;
     }
-#endif
   } else {
     const char* str = inputStr.c_str();
     char* strEnd = nullptr;
@@ -1075,9 +1245,9 @@ DataTypeList::DataTypeList() {
   // signed number (fraction 1/1000), -32.767 - +32.767, big endian
   add(new NumberDataType("FLR", 16, SIG|REV, 0x8000, 0x8001, 0x7fff, 1000));
   // signed number (IEEE 754 binary32: 1 bit sign, 8 bits exponent, 23 bits significand), little endian
-  add(new NumberDataType("EXP", 32, SIG|EXP, 0x7f800000, 0x00000000, 0xffffffff, 1));
+  add(new NumberDataType("EXP", 32, SIG|EXP, 0x7f800000, 0xfeffffff, 0x7effffff, 1));
   // signed number (IEEE 754 binary32: 1 bit sign, 8 bits exponent, 23 bits significand), big endian
-  add(new NumberDataType("EXR", 32, SIG|EXP|REV, 0x7f800000, 0x00000000, 0xffffffff, 1));
+  add(new NumberDataType("EXR", 32, SIG|EXP|REV, 0x7f800000, 0xfeffffff, 0x7effffff, 1));
   // unsigned integer, 0 - 65534, little endian
   add(new NumberDataType("UIN", 16, 0, 0xffff, 0, 0xfffe, 1));
   // unsigned integer, 0 - 65534, big endian
@@ -1119,7 +1289,7 @@ DataTypeList* DataTypeList::getInstance() {
 void DataTypeList::dump(OutputFormat outputFormat, bool appendDivisor, ostream* output) const {
   bool json = outputFormat & OF_JSON;
   string sep = "\n";
-  for (const auto &it: m_typesById) {
+  for (const auto &it : m_typesById) {
     const DataType *dataType = it.second;
     if (dataType->hasFlag(DUP)) {
       continue;

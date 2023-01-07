@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2014-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2014-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,7 +26,6 @@
 #include <algorithm>
 #include "ebusd/main.h"
 #include "lib/utils/log.h"
-#include "lib/utils/httpclient.h"
 #include "lib/ebus/data.h"
 
 namespace ebusd {
@@ -108,7 +107,8 @@ result_t UserList::addFromFile(const string& filename, unsigned int lineNo, map<
 MainLoop::MainLoop(const struct options& opt, Device *device, MessageMap* messages)
   : Thread(), m_device(device), m_reconnectCount(0), m_userList(opt.accessLevel), m_messages(messages),
     m_address(opt.address), m_scanConfig(opt.scanConfig), m_initialScan(opt.readOnly ? ESC : opt.initialScan),
-    m_polling(opt.pollInterval > 0), m_enableHex(opt.enableHex), m_shutdown(false), m_runUpdateCheck(opt.updateCheck) {
+    m_polling(opt.pollInterval > 0), m_enableHex(opt.enableHex), m_shutdown(false), m_runUpdateCheck(opt.updateCheck),
+    m_httpClient(opt.caFile, opt.caPath) {
   m_device->setListener(this);
   // open Device
   result_t result = m_device->open();
@@ -213,12 +213,16 @@ MainLoop::~MainLoop() {
 /** the initial delay for running the update check. */
 #define CHECK_INITIAL_DELAY (2*60)
 
+/** the number of completed scan runs after which to try again failed ones. */
+#define SCAN_REPEAT_COUNT 6
+
 void MainLoop::run() {
   bool reload = true;
   time_t lastTaskRun, now, start, lastSignal = 0, since, sinkSince = 1, nextCheckRun;
   int taskDelay = 5;
   symbol_t lastScanAddress = 0;  // 0 is known to be a master
-  string lastScanStatus = ".";
+  scanStatus_t lastScanStatus = SCAN_STATUS_NONE;
+  int scanCompleted = 0;
   time(&now);
   start = now;
   lastTaskRun = now;
@@ -231,7 +235,7 @@ void MainLoop::run() {
     if (dataHandler->isDataSink()) {
       dataSinks.push_back(dynamic_cast<DataSink*>(dataHandler));
     }
-    dataHandler->start();
+    dataHandler->startHandler();
   }
   while (!m_shutdown) {
     // pick the next message to handle
@@ -254,7 +258,7 @@ void MainLoop::run() {
       }
       if (m_scanConfig) {
         bool loadDelay = false;
-        string scanStatus = lastScanStatus;
+        scanStatus_t scanStatus = lastScanStatus;
         if (m_initialScan != ESC && reload && m_busHandler->hasSignal()) {
           loadDelay = true;
           result_t result;
@@ -262,7 +266,7 @@ void MainLoop::run() {
             logNotice(lf_main, "starting initial full scan");
             result = m_busHandler->startScan(true, "*");
             if (result == RESULT_OK) {
-              scanStatus = "running";
+              scanStatus = SCAN_STATUS_RUNNING;
             }
           } else if (m_initialScan == BROADCAST) {
             logNotice(lf_main, "starting initial broadcast scan");
@@ -286,26 +290,27 @@ void MainLoop::run() {
               if (m_busHandler->formatScanResult(m_initialScan, false, &ret)) {
                 logNotice(lf_main, "initial scan result: %s", ret.str().c_str());
               }
-              scanStatus = "running";
+              scanStatus = SCAN_STATUS_RUNNING;
             }
           }
           if (result != RESULT_OK) {
             logError(lf_main, "initial scan failed: %s", getResultCode(result));
-          }
-          if (result != RESULT_ERR_NO_SIGNAL) {
+          } else {
             reload = false;
           }
         }
-        if (!loadDelay) {
-          lastScanAddress = m_busHandler->getNextScanAddress(lastScanAddress);
+        if (!loadDelay && m_busHandler->hasSignal()) {
+          lastScanAddress = m_busHandler->getNextScanAddress(lastScanAddress, scanCompleted >= SCAN_REPEAT_COUNT);
           if (lastScanAddress == SYN) {
             taskDelay = 5;
             lastScanAddress = 0;
-            scanStatus = "finished";
-          } else {
-            if (scanStatus != "running") {
-              scanStatus = "running";
+            scanStatus = SCAN_STATUS_FINISHED;
+            scanCompleted++;
+            if (scanCompleted > SCAN_REPEAT_COUNT) {  // repeat failed scan only every Nth time
+              scanCompleted = 0;
             }
+          } else {
+            scanStatus = SCAN_STATUS_RUNNING;
             nextCheckRun = now + CHECK_INITIAL_DELAY;
             result_t result = m_busHandler->scanAndWait(lastScanAddress, true);
             taskDelay = (result == RESULT_ERR_NO_SIGNAL) ? 10 : 1;
@@ -329,10 +334,19 @@ void MainLoop::run() {
         if (m_messages->sizeConditions() > 0 && !m_polling) {
           logError(lf_main, "conditions require a poll interval > 0");
         }
+        // notify data sinks to make them update the messages
+        for (const auto dataSink : dataSinks) {
+          dataSink->notifyScanStatus(SCAN_STATUS_FINISHED);
+        }
       }
       if (m_runUpdateCheck && !m_shutdown && now > nextCheckRun) {
-        HttpClient client;
-        if (!client.connect("upd.ebusd.eu", 80, PACKAGE_NAME "/" PACKAGE_VERSION)) {
+        if (!m_httpClient.connect("upd.ebusd.eu",
+#ifdef HAVE_SSL
+                            443, true,
+#else
+                            80, false,
+#endif
+                            PACKAGE_NAME "/" PACKAGE_VERSION)) {
           logError(lf_main, "update check connect error");
         } else {
           ostringstream ostr;
@@ -351,13 +365,19 @@ void MainLoop::run() {
                << ",\"a\":\"other\""
 #endif
                << ",\"u\":" << (now-start);
+          if (m_device->isEnhancedProto()) {
+            string ver = m_device->getEnhancedVersion();
+            if (!ver.empty()) {
+              ostr << ",\"dv\":\"" << ver << "\"";
+            }
+          }
           if (m_reconnectCount) {
             ostr << ",\"rc\":" << m_reconnectCount;
           }
           m_busHandler->formatUpdateInfo(&ostr);
           ostr << "}";
           string response;
-          if (!client.post("/", ostr.str(), &response)) {
+          if (!m_httpClient.post("/", ostr.str(), &response)) {
             logError(lf_main, "update check error: %s", response.c_str());
           } else {
             m_updateCheck = response.empty() ? "unknown" : response;
@@ -1508,9 +1528,12 @@ result_t MainLoop::executeFind(const vector<string>& args, const string& levels,
           struct tm td;
           localtime_r(&lastup, &td);
           size_t len = strlen(str);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
           snprintf(str+len, sizeof(str)-len, ", lastup=%04d-%02d-%02d %02d:%02d:%02d",
             td.tm_year+1900, td.tm_mon+1, td.tm_mday,
             td.tm_hour, td.tm_min, td.tm_sec);
+#pragma GCC diagnostic pop
         }
         *ostream << " [ZZ=" << str;
         if (message->isPassive()) {
@@ -1802,6 +1825,9 @@ result_t MainLoop::executeScan(const vector<string>& args, const string& levels,
       return RESULT_OK;
     }
 
+    if (!m_busHandler->hasSignal()) {
+      return RESULT_ERR_NO_SIGNAL;
+    }
     result_t result;
     symbol_t dstAddress = (symbol_t)parseInt(args[1].c_str(), 16, 0, 0xff, &result);
     if (result == RESULT_OK && !isValidAddress(dstAddress, false)) {
@@ -1920,12 +1946,21 @@ result_t MainLoop::executeInfo(const vector<string>& args, const string& user, o
   if (!m_device->isValid()) {
     *ostream << ", invalid";
   }
+  bool infoAdded = false;
   if (verbose) {
     string info = m_device->getEnhancedInfos();
     if (!info.empty()) {
       *ostream << ", " << info;
+      infoAdded = true;
     }
   }
+  if (!infoAdded) {
+    string info = m_device->getEnhancedVersion();
+    if (!info.empty()) {
+      *ostream << ", firmware " << info;
+    }
+  }
+
   *ostream << "\n";
   if (!user.empty()) {
     *ostream << "user: " << user << "\n";
@@ -2092,7 +2127,7 @@ result_t MainLoop::executeGet(const vector<string>& args, bool* connected, ostri
           }
           size_t comma = value.find(',');
           if (comma == string::npos || comma == 0
-          || value.find(circuit+","+name+",") != comma+1) { // ensure same circuit+name
+          || value.find(circuit+","+name+",") != comma+1) {  // ensure same circuit+name
             ret = RESULT_ERR_INVALID_ARG;
             break;
           }
@@ -2293,13 +2328,17 @@ result_t MainLoop::executeGet(const vector<string>& args, bool* connected, ostri
           def = value;
         } else if (qname == "raw") {
           raw = value;
+        } else {
+          ret = RESULT_ERR_INVALID_ARG;
         }
         if (ret != RESULT_OK) {
           break;
         }
       }
     }
-    if (ret == RESULT_OK) {
+    if (def.empty() || raw.empty()) {
+      ret = RESULT_ERR_INVALID_ARG;
+    } else if (ret == RESULT_OK) {
       time_t now;
       time(&now);
       istringstream defstr("#\n" + def);  // ensure first line is not used for determining col names
@@ -2307,15 +2346,17 @@ result_t MainLoop::executeGet(const vector<string>& args, bool* connected, ostri
       DataFieldTemplates* templates = getTemplates("*");
       LoadableDataFieldSet fields("", templates);
       ret = fields.readFromStream(&defstr, "temporary", now, true, nullptr, &errorDescription);
-      if (ret == RESULT_OK) {
-        const SingleDataField* field = fields[0];
+      if (ret == RESULT_OK && fields.size()) {
         SlaveSymbolString slave;
         slave.push_back(0);  // dummy length
         ret = slave.parseHex(raw);
-        if (ret == RESULT_OK) {
+        const SingleDataField* field = fields[0];
+        if (ret == RESULT_OK && field) {
           slave.adjustHeader();
           ret = field->read(slave, 0, false, nullptr, 0, OF_JSON|OF_SHORT, 0, ostream);
         }
+      } else {
+        ret = RESULT_ERR_INVALID_ARG;
       }
       type = 6;
     }
@@ -2414,7 +2455,11 @@ result_t MainLoop::formatHttpResult(result_t ret, int type, ostringstream* ostre
     break;
   case RESULT_ERR_INVALID_ARG:
   case RESULT_ERR_INVALID_NUM:
+  case RESULT_ERR_INVALID_POS:
   case RESULT_ERR_OUT_OF_RANGE:
+  case RESULT_ERR_INVALID_PART:
+  case RESULT_ERR_MISSING_ARG:
+  case RESULT_ERR_INVALID_LIST:
     *ostream << "400 Bad Request";
     break;
   case RESULT_ERR_NOTAUTHORIZED:

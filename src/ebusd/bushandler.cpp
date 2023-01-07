@@ -1,6 +1,6 @@
 /*
  * ebusd - daemon for communication with eBUS heating systems.
- * Copyright (C) 2014-2021 John Baier <ebusd@ebusd.eu>
+ * Copyright (C) 2014-2022 John Baier <ebusd@ebusd.eu>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -108,6 +108,7 @@ result_t ScanRequest::prepare(symbol_t ownMasterAddress) {
 
 bool ScanRequest::notify(result_t result, const SlaveSymbolString& slave) {
   symbol_t dstAddress = m_master[1];
+  m_busHandler->setScanResult(dstAddress, 0, "");
   if (result == RESULT_OK) {
     if (m_message == m_messageMap->getScanMessage()) {
       Message* message = m_messageMap->getScanMessage(dstAddress);
@@ -268,6 +269,18 @@ bool GrabbedMessage::dump(bool unknown, MessageMap* messages, bool first, Output
   }
   symbol_t dstAddress = m_lastMaster[1];
   if (outputFormat & OF_JSON) {
+    if (outputFormat & OF_SHORT) {
+      *output << '"' << m_lastMaster.getStr() << '/';
+      if (dstAddress != BROADCAST && !isMaster(dstAddress)) {
+        *output << m_lastSlave.getStr();
+      }
+      *output << '/' << static_cast<unsigned>(m_count);
+      if (message) {
+        *output << '/' << message->getName();
+      }
+      *output << '"';
+      return true;
+    }
     *output << "\n{";
     if (m_lastMaster.dumpJson(false, output)) {
       *output << ", ";
@@ -308,7 +321,8 @@ bool GrabbedMessage::dump(bool unknown, MessageMap* messages, bool first, Output
   }
   for (const auto& it : *types) {
     const DataType* baseType = it.second;
-    if ((baseType->getBitCount() % 8) != 0 || baseType->isIgnored() || baseType->hasFlag(DUP)) {  // skip bit and ignored types
+    if ((baseType->getBitCount() % 8) != 0 || baseType->isIgnored() || baseType->hasFlag(DUP)) {
+      // skip bit and ignored types
       continue;
     }
     size_t maxLength = baseType->getBitCount()/8;
@@ -348,6 +362,9 @@ void BusHandler::clear() {
 }
 
 result_t BusHandler::sendAndWait(const MasterSymbolString& master, SlaveSymbolString* slave) {
+  if (m_state == bs_noSignal) {
+    return RESULT_ERR_NO_SIGNAL;  // don't wait when there is no signal
+  }
   result_t result = RESULT_ERR_NO_SIGNAL;
   slave->clear();
   ActiveBusRequest request(master, slave);
@@ -482,14 +499,17 @@ result_t BusHandler::handleSymbol() {
           Message* message = m_messages->getNextPoll();
           if (message != nullptr) {
             m_lastPoll = now;
-            auto request = new PollRequest(message);
-            result_t ret = request->prepare(m_ownMasterAddress);
-            if (ret != RESULT_OK) {
-              logError(lf_bus, "prepare poll message: %s", getResultCode(ret));
-              delete request;
-            } else {
-              startRequest = request;
-              m_nextRequests.push(request);
+            if (difftime(now, message->getLastUpdateTime()) > m_pollInterval) {
+              // only poll this message if it was not updated already by other means within the interval
+              auto request = new PollRequest(message);
+              result_t ret = request->prepare(m_ownMasterAddress);
+              if (ret != RESULT_OK) {
+                logError(lf_bus, "prepare poll message: %s", getResultCode(ret));
+                delete request;
+              } else {
+                startRequest = request;
+                m_nextRequests.push(request);
+              }
             }
           }
         }
@@ -648,7 +668,8 @@ result_t BusHandler::handleSymbol() {
   }
   switch (arbitrationState) {
     case as_lost:
-      logDebug(lf_bus, "arbitration lost");
+    case as_timeout:
+      logDebug(lf_bus, arbitrationState == as_lost ? "arbitration lost" : "arbitration lost (timed out)");
       if (m_currentRequest == nullptr) {
         BusRequest *startRequest = m_nextRequests.peek();
         if (startRequest != nullptr && m_nextRequests.remove(startRequest)) {
@@ -767,7 +788,7 @@ result_t BusHandler::handleSymbol() {
       // check arbitration
       if (recvSymbol == sendSymbol) {  // arbitration successful
         // measure arbitration delay
-        long long latencyLong = (sentTime.tv_sec*1000000000 + sentTime.tv_nsec
+        int64_t latencyLong = (sentTime.tv_sec*1000000000 + sentTime.tv_nsec
         - m_lastSynReceiveTime.tv_sec*1000000000 - m_lastSynReceiveTime.tv_nsec)/1000;
         if (latencyLong >= 0 && latencyLong <= 10000) {  // skip clock skew or out of reasonable range
           auto latency = static_cast<int>(latencyLong);
@@ -1014,9 +1035,9 @@ result_t BusHandler::handleSymbol() {
 
   case bs_sendSyn:
     if (!sending) {
-      return setState(bs_skip, RESULT_ERR_INVALID_ARG);
+      return setState(bs_ready, RESULT_ERR_INVALID_ARG);
     }
-    return setState(bs_skip, RESULT_OK);
+    return setState(bs_ready, RESULT_OK);
   }
   return RESULT_OK;
 }
@@ -1072,13 +1093,18 @@ result_t BusHandler::setState(BusState state, result_t result, bool firstRepetit
     logDebug(lf_bus, "%s during %s, switching to %s", getResultCode(result), getStateCode(m_state),
         getStateCode(state));
   } else if (m_currentRequest != nullptr || state == bs_sendCmd || state == bs_sendCmdCrc || state == bs_sendCmdAck
-      || state == bs_sendRes || state == bs_sendResCrc || state == bs_sendResAck || state == bs_sendSyn) {
+      || state == bs_sendRes || state == bs_sendResCrc || state == bs_sendResAck || state == bs_sendSyn
+      || m_state == bs_sendSyn) {
     logDebug(lf_bus, "switching from %s to %s", getStateCode(m_state), getStateCode(state));
   }
   if (state == bs_noSignal) {
-    logError(lf_bus, "signal lost");
+    if (m_generateSynInterval == 0 || m_state != bs_skip) {
+      logError(lf_bus, "signal lost");
+    }
   } else if (m_state == bs_noSignal) {
-    logNotice(lf_bus, "signal acquired");
+    if (m_generateSynInterval == 0 || state != bs_skip) {
+      logNotice(lf_bus, "signal acquired");
+    }
   }
   m_state = state;
 
@@ -1096,7 +1122,7 @@ result_t BusHandler::setState(BusState state, result_t result, bool firstRepetit
 }
 
 void BusHandler::measureLatency(struct timespec* sentTime, struct timespec* recvTime) {
-  long long latencyLong = (recvTime->tv_sec*1000000000 + recvTime->tv_nsec
+  int64_t latencyLong = (recvTime->tv_sec*1000000000 + recvTime->tv_nsec
       - sentTime->tv_sec*1000000000 - sentTime->tv_nsec)/1000000;
   if (latencyLong < 0 || latencyLong > 1000) {
     return;  // clock skew or out of reasonable range
@@ -1459,6 +1485,8 @@ void BusHandler::formatSeenInfo(ostringstream* output) const {
           *output << "\"";
         }
       }
+    } else if ((m_seenAddresses[address]&SCAN_INIT) != 0) {
+      *output << ", scanning";
     }
     const vector<string>& loadedFiles = m_messages->getLoadedFiles(address);
     if (!loadedFiles.empty()) {
@@ -1493,13 +1521,21 @@ void BusHandler::formatUpdateInfo(ostringstream* output) const {
           << ",\"co\":" << (m_addressConflict ? 1 : 0);
   if (m_grabMessages) {
     size_t unknownCnt = 0;
+    *output << ",\"gm\":[";
+    bool first = true;
     for (auto it : m_grabbedMessages) {
+      if (it.second.dump(false, m_messages, first, OF_JSON|OF_SHORT, output)) {
+        first = false;
+      }
       Message* message = m_messages->find(it.second.getLastMasterData());
       if (!message) {
         unknownCnt++;
       }
     }
-    *output << ",\"gu\":" << unknownCnt;
+    *output << "],\"gu\":" << unknownCnt;
+  }
+  if (!m_messages->getPreferLanguage().empty()) {
+    *output << ",\"lc\":\"" << m_messages->getPreferLanguage() << "\"";
   }
   unsigned char address = 0;
   for (int index = 0; index < 256; index++, address++) {
@@ -1655,7 +1691,7 @@ void BusHandler::formatGrabResult(bool unknown, OutputFormat outputFormat, ostri
   }
 }
 
-symbol_t BusHandler::getNextScanAddress(symbol_t lastAddress) const {
+symbol_t BusHandler::getNextScanAddress(symbol_t lastAddress, bool withUnfinished) const {
   if (lastAddress == SYN) {
     return SYN;
   }
@@ -1663,14 +1699,16 @@ symbol_t BusHandler::getNextScanAddress(symbol_t lastAddress) const {
     if (!isValidAddress(lastAddress, false) || isMaster(lastAddress)) {
       continue;
     }
-    if ((m_seenAddresses[lastAddress]&(SEEN|LOAD_INIT)) == SEEN) {
+    if ((m_seenAddresses[lastAddress]&(SEEN|LOAD_INIT)) == SEEN
+    || (withUnfinished && (m_seenAddresses[lastAddress]&(SEEN|SCAN_DONE|LOAD_INIT)) == (SEEN|LOAD_INIT))) {
       return lastAddress;
     }
     symbol_t master = getMasterAddress(lastAddress);
     if (master == SYN || (m_seenAddresses[master]&SEEN) == 0) {
       continue;
     }
-    if ((m_seenAddresses[lastAddress]&LOAD_INIT) == 0) {
+    if ((m_seenAddresses[lastAddress]&LOAD_INIT) == 0
+    || (withUnfinished && (m_seenAddresses[lastAddress]&(SCAN_DONE|LOAD_INIT)) == LOAD_INIT)) {
       return lastAddress;
     }
   }
